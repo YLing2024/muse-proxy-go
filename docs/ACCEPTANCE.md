@@ -109,7 +109,7 @@ body: {"type": "error", "error": {"message": "upstream failed: HTTP Error 503: S
 
 `2xx` 状态码透传、上游自定义头 `X-Fake-Upstream` 透传、自设 `Content-Length` 与 body 字节数一致；
 上游 `4xx/5xx` 与未带 `Location` 的 `3xx` 一律回 `502` + `upstream failed: HTTP Error <code>: <reason>`
-（`<reason>` 取上游状态行原样短语，空则标准表兜底；需求书 §6.4）。
+（`<reason>` 取上游状态行原样短语，未给短语时留空——与旧实现一致，不用标准表兜底；需求书 §6.4）。
 
 ## 5. 错误分支 502（不可达 / 超时）
 

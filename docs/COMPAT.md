@@ -138,13 +138,15 @@ UTF-8（含 UTF-8 BOM、以及 `surrogatepass` 允许的代理区编码）已逐
 **上游响应状态行本身**（`http.client` 对状态行做 `split(None, 2)` 后 `reason.strip()`），
 不是任何标准表。本版现已按同一口径取值，逻辑在 `internal/httpx.StatusLineReason`：
 
-- **优先**用上游状态行给的原样短语：上游写 `HTTP/1.1 413 Nope` → 文案即
+- **原样取用**上游状态行给的短语：上游写 `HTTP/1.1 413 Nope` → 文案即
   `upstream failed: HTTP Error 413: Nope`；上游写 `HTTP/1.1 599 Weird` → `... 599: Weird`。
   非标准码（413/414/416/418/599…）因此也与旧实现逐字节一致，不必再纠结 RFC 改名。
-- **仅当**上游没给短语时，才回落到标准表 `internal/httpx.ReasonPhrase`。触发条件是
-  HTTP/2 无 reason，或状态行在码后即结束 / 码后只有空白；表以本机 Python 3.13.5 的
-  `http.client.responses` 逐项生成，未收录的码回 `Unknown`。**标准表只在这时兜底**，
-  故表里保留经典还是新版短语都不影响一致性（413/422 仍沿用需求书 §2.6 列举值）。
+- **上游未给短语时留空串**：状态行在码后即结束、或码后只有空白时，旧实现
+  `HTTPError.msg` 就是空串，输出形如 `HTTP Error 500: `（冒号后为空）。本版
+  `StatusLineReason` 同样返回空串，**不用任何标准短语表兜底**——旧实现从不查表，
+  若改用标准表（如回 `Internal Server Error` / `Unknown`）反而会逐字节不一致。
+  （2026-10-16 修正：此前版本内置过一份 `http.client.responses` 兜底表，独立假上游
+  实测「上游只写码」形态与旧实现不符，已删除该表。）
 
 并排对照（假上游 = Go `net/http`，其状态行短语即 Go `http.StatusText`，旧实现读到的正是同一批）
 现在全部逐字节一致：
@@ -156,10 +158,12 @@ UTF-8（含 UTF-8 BOM、以及 `surrogatepass` 允许的代理区编码）已逐
 | `416` | 502 `... 416: Requested Range Not Satisfiable` | 同左 | 逐字节一致 |
 | `418` | 502 `... 418: I'm a teapot` | 同左 | 逐字节一致 |
 | `599`（未收录） | 502 `... 599: status code 599` | 同左 | 逐字节一致 |
+| `500`（只写码） | 502 `... 500: `（冒号后为空） | 同左 | 逐字节一致 |
 
-单测 `internal/httpx.TestStatusLineReasonPrefersUpstream` 覆盖「非标准短语原样取用」
-「码后只有空白回落标准表」「状态行缺失回落标准表」；`internal/proxy` 的
-`TestUpstreamReasonPhraseTakenVerbatim` 用裸 TCP 上游注入自定义状态行做端到端验证。
+单测 `internal/httpx.TestStatusLineReasonTakenVerbatim` 覆盖「标准 / 非标准短语原样取用」
+「只写码 / 码后空白 / 状态行缺失 → 空串」；`internal/proxy` 的
+`TestUpstreamReasonPhraseTakenVerbatim` 用裸 TCP 上游注入自定义状态行做端到端验证
+（含 `500 ` → 冒号后为空）。
 
 至此，**上游按 HTTP 应答时的 502 文案已全部对齐**。唯一仍无法逐字节对齐的一类只剩
 **非 HTTP 异常**的文案（不可达 / 超时 / TLS 失败等：Go 运行时措辞 vs Python `URLError`），
@@ -190,10 +194,9 @@ The last 30x error message was:
 <reason>
 ```
 
-`<code>` 取触发判环那一次 3xx 的状态码；`<reason>` 取它状态行的原样短语，空则按 §2.3
-的标准表兜底。并排对照（同一环上游兼出口代理，旧 = 同源副本 `19393`、
-新缓冲 `19287`、新流式 `19288`；复现命令 `bash .acceptance/redirect-parity.sh`，
-原始输出 `.acceptance/redirect-parity.out`）：
+`<code>` 取触发判环那一次 3xx 的状态码；`<reason>` 取它状态行的原样短语，未给短语时留空
+（同 §2.3；2026-10-16 修正）。并排对照（同一环上游兼出口代理；复现脚本 `bash .acceptance/redirect-parity.sh`，
+原始输出 `.acceptance/redirect-parity.out`，该目录不入库）：
 
 | 用例 | 环形态 | 旧（19393） | 新缓冲（19287） | 新流式（19288） | 结论 |
 |---|---|---|---|---|---|
@@ -233,3 +236,19 @@ The last 30x error message was:
 - key 只从 `MUSE_UPSTREAM_KEY` 或两个本地配置文件读取；不打印、不进错误信息、不进响应。
 - 仓库内**没有任何密钥文件**；`.env.example` 与 `deploy/` 样例只含占位符。
 - 强制经出口代理，**不直连上游**；出口代理不可达时返回 `502` 而非直连。
+
+## 5. 对照复核记录（2026-10-16，独立假上游 + 假出口代理）
+
+用独立编写的假上游（正确实现 HEAD、支持 DELETE 等任意方法、透传自定义响应头）与假出口代理
+（在转发给上游的请求上注入标记头 `X-Fake-Via-Proxy`，据此区分「经代理」与「直连」），
+对旧实现同源副本与新版缓冲/流式两档做并排复核。三项曾报差异，复核结论如下：
+
+| 曾报差异 | 复核结论 | 证据 |
+|---|---|---|
+| 非法 JSON 的 400 文案（Go `encoding/json` 措辞） | **假阳性（不可复现）** | 现版 `{not json` 回 `bad request: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)`，与旧实现逐字节一致（走 `httpx.PyDecode` 移植的 CPython 扫描器）；另测 `[1,2]`/`"hi"`/`null`/`tru`/`{"a":1,}` 等亦逐字节一致。 |
+| `DELETE /v1/files/abc` 回 502 | **假阳性（harness 缺陷）** | 用正确处理 DELETE 的假上游实测：旧 = 新 = `200`，上游自定响应头 `X-Custom-Passthrough` 透传一致；该 502 未能复现，旧 harness 的假上游/代理在 DELETE 上出现过 BrokenPipe。 |
+| 代理不可达时假上游收到 1 次直连 | **假阳性（判据缺陷）** | 关掉出口代理后新版回 `502`，且带 `X-Fake-Via-Proxy` 标记的「经代理」计数为 1、**无标记的直连计数为 0**；此前把「经代理到达上游」误计为直连。另验证 `NO_PROXY=*` 与 `HTTP_PROXY`/`HTTPS_PROXY` 指向坏地址时仍强制走 `MIXED_PROXY`（Go `Transport.Proxy` 为固定函数，不读代理环境变量）。 |
+
+复核另发现一处真实差异并已修复：上游状态行未给 reason 短语时，本版曾用标准表兜底
+（回 `Internal Server Error` / `Unknown`），而旧实现留空串；见 §2.3。修复后并排矩阵
+（非法 JSON / 五方法 / 上游各状态码 / 代理不可达 / 重定向环 / 缓冲 vs 流式）全部一致。
