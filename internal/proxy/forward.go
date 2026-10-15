@@ -18,7 +18,8 @@ var droppedResponseHeaders = map[string]bool{
 	"content-length":    true,
 }
 
-// forward 把请求转发到上游并把响应回传。任何转发期错误都归为 502，message 前缀 upstream failed。
+// forward 把请求转发到上游并把响应回传。转发期错误（不可达/超时等）与上游 4xx/5xx
+// 都归为 502，message 前缀 upstream failed（复刻旧实现，见 §2.6）。
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, body []byte) {
 	var reader io.Reader
 	if len(body) > 0 {
@@ -57,11 +58,28 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, b
 	}
 	defer resp.Body.Close()
 
+	// 复刻旧实现：urllib 的 HTTPErrorProcessor 对所有非 2xx/3xx 抛 HTTPError，被
+	// 外层 except 吞掉后统一 _reply(502)，文案为 upstream failed: HTTP Error <code>: <reason>。
+	// 因此上游 4xx/5xx 一律回 502（不是透传），2xx/3xx 才照旧回传。
+	//
+	// 该判定必须发生在任何响应头落盘之前，流式模式下同样如此：能到这里说明上游
+	// 尚未提交 2xx，故流式档也把 4xx/5xx 变 502，与缓冲档一致。
+	if resp.StatusCode >= http.StatusBadRequest {
+		httpx.WriteError(w, http.StatusBadGateway, upstreamHTTPErrorMessage(resp.StatusCode))
+		return
+	}
+
 	if p.stream {
 		p.streamResponse(w, resp)
 		return
 	}
 	p.bufferedResponse(w, resp)
+}
+
+// upstreamHTTPErrorMessage 复刻旧实现把上游 4xx/5xx 变成 502 时的内层文案：
+// `upstream failed: HTTP Error <code>: <reason>`，reason 取 Python 标准原因短语。
+func upstreamHTTPErrorMessage(code int) string {
+	return "upstream failed: HTTP Error " + strconv.Itoa(code) + ": " + httpx.ReasonPhrase(code)
 }
 
 // bufferedResponse 是默认模式：整段读完后自设 Content-Length 回传（与旧实现可观测行为一致）。

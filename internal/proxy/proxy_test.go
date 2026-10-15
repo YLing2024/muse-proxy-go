@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -222,23 +223,97 @@ func TestResponsePassthrough(t *testing.T) {
 	fp := newFakeProxy(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("X-Upstream-Marker", "abc")
 		w.Header().Set("Transfer-Encoding", "chunked")
-		w.WriteHeader(http.StatusServiceUnavailable)
-		_, _ = io.WriteString(w, "upstream-error-body")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = io.WriteString(w, "created-body")
 	})
 	srv, _ := newTestProxy(t, &config.Config{}, fp)
 
 	resp, body := doReq(t, srv.URL, "POST", "/v1/chat/completions", `{"model":"muse-spark-1.3-contributor"}`, nil)
-	if resp.StatusCode != http.StatusServiceUnavailable {
-		t.Fatalf("状态码应透传 503，得到 %d", resp.StatusCode)
+	if resp.StatusCode != http.StatusCreated {
+		t.Fatalf("2xx 状态码应透传 201，得到 %d", resp.StatusCode)
 	}
 	if resp.Header.Get("X-Upstream-Marker") != "abc" {
 		t.Fatalf("上游自定义头应透传，得到 %q", resp.Header.Get("X-Upstream-Marker"))
 	}
-	if body != "upstream-error-body" {
+	if body != "created-body" {
 		t.Fatalf("响应体应原样回传，得到 %q", body)
 	}
-	if resp.Header.Get("Content-Length") != "19" {
-		t.Fatalf("Content-Length 应为 19，得到 %q", resp.Header.Get("Content-Length"))
+	if resp.Header.Get("Content-Length") != "12" {
+		t.Fatalf("Content-Length 应为 12，得到 %q", resp.Header.Get("Content-Length"))
+	}
+}
+
+// TestUpstreamErrorStatusBecomes502 复刻旧实现：上游 4xx/5xx 一律回 502，
+// 错误体逐字节等于 `{"type": "error", "error": {"message": "upstream failed: HTTP Error <code>: <reason>"}}`。
+// 状态码与响应体取自需求书 §2.6；reason 取自 Python `http.client.responses`。
+func TestUpstreamErrorStatusBecomes502(t *testing.T) {
+	cases := []struct {
+		code   int
+		reason string
+	}{
+		{400, "Bad Request"},
+		{401, "Unauthorized"},
+		{403, "Forbidden"},
+		{404, "Not Found"},
+		{405, "Method Not Allowed"},
+		{409, "Conflict"},
+		{413, "Payload Too Large"},
+		{422, "Unprocessable Entity"},
+		{429, "Too Many Requests"},
+		{500, "Internal Server Error"},
+		{502, "Bad Gateway"},
+		{503, "Service Unavailable"},
+		{504, "Gateway Timeout"},
+		{599, "Unknown"},
+	}
+	for _, c := range cases {
+		c := c
+		fp := newFakeProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(c.code)
+			_, _ = io.WriteString(w, `{"upstream":"error-body-must-not-leak"}`)
+		})
+		srv, _ := newTestProxy(t, &config.Config{}, fp)
+
+		resp, body := doReq(t, srv.URL, "POST", "/v1/chat/completions", `{"model":"muse-spark-1.3-contributor"}`, nil)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("上游 %d 应回 502，得到 %d", c.code, resp.StatusCode)
+			continue
+		}
+		want := `{"type": "error", "error": {"message": "upstream failed: HTTP Error ` +
+			strconv.Itoa(c.code) + `: ` + c.reason + `"}}`
+		if body != want {
+			t.Errorf("上游 %d 错误体不一致：\n got=%s\nwant=%s", c.code, body, want)
+		}
+		if ct := resp.Header.Get("Content-Type"); ct != "application/json" {
+			t.Errorf("上游 %d 的 Content-Type 应为 application/json，得到 %q", c.code, ct)
+		}
+		if cl := resp.Header.Get("Content-Length"); cl != strconv.Itoa(len(want)) {
+			t.Errorf("上游 %d 的 Content-Length 应为 %d，得到 %q", c.code, len(want), cl)
+		}
+	}
+}
+
+// TestStreamingUpstreamErrorBecomes502 验证 MUSE_STREAM=1 真流式档在响应头落盘前
+// 发现上游 4xx/5xx 时，同样回 502 错误体（而非透传上游状态码）。
+func TestStreamingUpstreamErrorBecomes502(t *testing.T) {
+	fp := newFakeProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = io.WriteString(w, "data: upstream-error\n\n")
+	})
+	srv, _ := newTestProxy(t, &config.Config{Stream: true}, fp)
+
+	resp, body := doReq(t, srv.URL, "POST", "/v1/chat/completions", `{"model":"muse-spark-1.3-contributor"}`, nil)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("流式档上游 503 应回 502，得到 %d", resp.StatusCode)
+	}
+	want := `{"type": "error", "error": {"message": "upstream failed: HTTP Error 503: Service Unavailable"}}`
+	if body != want {
+		t.Fatalf("流式档 502 错误体不一致：\n got=%s\nwant=%s", body, want)
+	}
+	if cl := resp.Header.Get("Content-Length"); cl != strconv.Itoa(len(want)) {
+		t.Fatalf("流式档 502 应带正确 Content-Length，得到 %q", cl)
 	}
 }
 
