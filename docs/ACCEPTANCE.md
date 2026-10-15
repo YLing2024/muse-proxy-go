@@ -329,6 +329,50 @@ new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 
 
 新版日志中未出现测试 key（`grep -c parity-key .acceptance/new-*.log` → `0`）。
 
+## 13. 重定向环文案对齐（2026-10-16）
+
+上游把请求导进重定向环时，旧实现 `urllib.HTTPRedirectHandler` 抛 `HTTPError` 被吞成 `502`。
+旧版文案与新版（Go 默认「stopped after 10 redirects」）不同，本轮用自定义
+`http.Client.CheckRedirect` 逐值复刻，两版已逐字节一致。
+
+同机、同环上游（`.acceptance/loopupstream.py`，同时充当出口代理以保留自定义 reason 短语）、
+同一请求矩阵：旧实现 = 同源副本（`PORT=19393`，仅换 4 个常量）、新缓冲 = `19287`、
+新流式 = `19288`。复现命令：`bash .acceptance/redirect-parity.sh`（原始输出见
+`.acceptance/redirect-parity.out`）。
+
+原始输出：
+
+```
+--- 路径 /v1/self ---
+old   502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+new0  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+--- 路径 /v1/weird ---
+old   502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nWeird"}}
+new0  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nWeird"}}
+new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nWeird"}}
+--- 路径 /v1/jitter ---
+old   502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+new0  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+--- 路径 /v1/r0 ---
+old   502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+new0  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\nThe last 30x error message was:\nFound"}}
+--- 路径 /v1/single ---
+old   200 | final-body
+new0  200 | final-body
+new1  200 | final-body
+--- 路径 /v1/double-a ---
+old   200 | final-body
+new0  200 | final-body
+new1  200 | final-body
+```
+
+跟随次数与旧实现一致（真机 Python `urllib` 探针：自环 5 次、302/303 抖动 9 次；
+Go 单测分别断言 5 / 9 / 11 次）。判环阈值逐值复刻 `urllib` 的 `max_repeats = 4`、
+`max_redirections = 10`；详细语义与单测清单见 `docs/COMPAT.md` §2.4。
+
 ## 端到端测试
 
 ```sh

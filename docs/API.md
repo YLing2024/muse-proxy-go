@@ -111,9 +111,9 @@
 | `400` | 请求带 body 但不是合法 JSON，或 JSON 不是对象 | `{"type": "error", "error": {"message": "bad request: <解析信息>"}}` |
 | `403` | body 的 `model` 不在白名单（含缺 `model`、`model` 非字符串） | `{"type": "error", "error": {"message": "model <m> not allowed through proxy"}}`，与旧实现逐字节一致 |
 | `501` | 方法不在路由表内 | 纯文本 `unsupported method`（对齐旧实现的状态码语义） |
-| `502` | 上游/出口代理不可达、超时等转发期出错；**或上游返回 4xx/5xx；或上游返回未带 `Location` 的 3xx** | `{"type": "error", "error": {"message": "upstream failed: <错误信息>"}}`；后两者 `<错误信息>` 为 `HTTP Error <code>: <reason>`（复刻旧实现，见下） |
+| `502` | 上游/出口代理不可达、超时等转发期出错；**或上游返回 4xx/5xx；或上游返回未带 `Location` 的 3xx；或上游重定向成环（含超过跟随上限）** | `{"type": "error", "error": {"message": "upstream failed: <错误信息>"}}`；中间两种 `<错误信息>` 为 `HTTP Error <code>: <reason>`，重定向环见下（复刻旧实现，见下） |
 | `2xx` | 上游最终返回的成功状态码 | 原样透传上游响应体与状态码 |
-| `3xx`（带 `Location`） | 上游返回 `Location`，由客户端跟随重定向 | 跟随后的最终响应（状态码/体/头）原样回传 |
+| `3xx`（带 `Location`） | 上游返回 `Location`，由客户端跟随重定向（非成环时） | 跟随后的最终响应（状态码/体/头）原样回传 |
 
 - **上游 4xx/5xx、未带 `Location` 的 3xx 的文案**：`upstream failed: HTTP Error <code>: <reason>`。
   `<reason>` **优先取上游状态行里的原样短语**（旧实现 `urllib` 的 `HTTPError` 文案即取此处，
@@ -122,6 +122,12 @@
   `404 Not Found`、`429 Too Many Requests`、`503 Service Unavailable`，未收录的码用 `Unknown`）。
   这是复刻旧实现（`urllib` 对非 2xx 抛 `HTTPError` 后被 `except` 吞成 502）；缓冲与
   `MUSE_STREAM=1` 两档行为一致。完整边界见 `docs/COMPAT.md` §2.1 / §2.3。
+- **重定向环的文案**：上游把请求导进环（同一 URL 跟随超过 4 次，或累计跟随超过 10 个
+  不同 URL）时，回 `502`，`<错误信息>` 逐字节复刻旧实现 `urllib`，形如
+  `HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.`
+  换行 `The last 30x error message was:` 换行 `<reason>`（`<reason>` 取值同上；`<code>` 取
+  触发判环那次 3xx 的状态码）。非环的普通 `3xx`（带 `Location`）仍照旧跟随，不受影响；
+  详见 `docs/COMPAT.md` §2.4。
 - 上游响应的响应头（除 `Transfer-Encoding` / `Connection` / `Content-Length`）原样透传；
   缓冲模式自算 `Content-Length`，流式模式改为 `chunked`。
 - `<解析信息>` 与 `<错误信息>` 中非 HTTP 类的具体文本由 Go 运行时产生，与 Python 版本的措辞不同

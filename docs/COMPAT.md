@@ -13,7 +13,7 @@
 | 3 | 白名单三分支 | 见下节「白名单」。`400` 内层文案复刻 Python `json` 模块的 `JSONDecodeError`（行列 / `char` 偏移逐字节一致，见 §2.2）。 |
 | 4 | 请求头过滤 + 覆盖 Authorization | 丢弃 `host` / `content-length` / `connection` / `authorization`，其余透传，`Authorization` 覆盖为 `Bearer <key>`；空 body 时向上游补发 `Content-Length: 0`（对齐旧实现 `data=b""`，见 §2.2）。 |
 | 5 | 响应头过滤 + 自设 Content-Length | 丢弃 `transfer-encoding` / `connection` / `content-length`，缓冲模式自设 `Content-Length`；**2xx 透传；3xx 带 `Location` 由客户端跟随、无 `Location` 的 3xx 回 502；4xx/5xx 一律回 502**（复刻旧实现，见 §2.1）。 |
-| 6 | 上游失败/超时 → 502 | 转发链路失败（不可达、超时、TLS 失败等非 HTTP 异常）回 `502`，message 前缀 `upstream failed: `；上游返回的 4xx/5xx、以及未被跟随的 3xx（无 `Location`）同样回 `502`（见 §2.1）。 |
+| 6 | 上游失败/超时 → 502 | 转发链路失败（不可达、超时、TLS 失败等非 HTTP 异常）回 `502`，message 前缀 `upstream failed: `；上游返回的 4xx/5xx、未被跟随的 3xx（无 `Location`）、以及**重定向环**同样回 `502`（见 §2.1 / §2.4）。 |
 | 7 | 五方法同处理器，其余 501 | `routeTable` 登记 GET/POST/PUT/DELETE/HEAD；未登记方法回 `501` 且不转发。 |
 | 8 | 上游超时 120 秒 | `MUSE_TIMEOUT` 默认 `120s`。 |
 | 9 | key 读取顺序，`!` 占位无效 | `env → PI_MODELS_JSON → OPENCODE_AUTH_JSON`，`!` 前缀跳过；仅启动读一次。 |
@@ -54,7 +54,7 @@
 | 自动 gzip | 不透明解压 | `DisableCompression=true`，同样不透明解压、不擅自加 `Accept-Encoding` | 行为一致（已显式对齐）。 |
 | 响应头重复值 | `email.message` 可能合并重复头 | 逐个 `Add` 保留 | 语义一致。 |
 | 上游请求头附加项 | `urllib` 额外加 `Accept-Encoding: identity`、`Connection: close`，无 body 时还会加 `Content-Type: application/x-www-form-urlencoded` | 纯透传（只转发客户端实际带的头），空 body 时补 `Content-Length: 0` | 需求书 §2.4 要求「其余原样透传」，故不复制 urllib 的运行时默认头；上游可见的额外头不同。 |
-| 重定向 | `urllib.HTTPRedirectHandler` 对 GET/HEAD/POST 跟随 301/302/303/307/308，其余方法（PUT/DELETE）或 POST+307/308 会抛 `HTTPError` → 502 | `net/http` 对 301/302/303/307/308 一律跟随（301/302/303 改 GET；307/308 保留方法与 body） | 带 `Location` 的常见形态（GET/POST + 302 等）两者都跟随、结果一致；仅「PUT/DELETE + 任意 3xx」与「POST + 307/308」两者处理不同（旧版 502、新版跟随），属已知边界。 |
+| 重定向 | `urllib.HTTPRedirectHandler` 对 GET/HEAD/POST 跟随 301/302/303/307/308，其余方法（PUT/DELETE）或 POST+307/308 会抛 `HTTPError` → 502 | `net/http` 对 301/302/303/307/308 一律跟随（301/302/303 改 GET；307/308 保留方法与 body） | 带 `Location` 的常见形态（GET/POST + 302 等）两者都跟随、结果一致；仅「PUT/DELETE + 任意 3xx」与「POST + 307/308」两者处理不同（旧版 502、新版跟随），属已知边界。重定向**环**的判定与文案现已对齐，见 §2.4。 |
 
 ## 2.1 状态码口径：复刻旧实现的 502（2026-10-16 定案）
 
@@ -167,6 +167,54 @@ UTF-8（含 UTF-8 BOM、以及 `surrogatepass` 允许的代理区编码）已逐
 
 3xx 无 `Location` 的 502 也已复刻（见 §2.1），单测 `internal/proxy.TestRedirectWithoutLocationBecomes502`
 与 `TestRedirectWithLocationIsFollowed` 分别覆盖「无 Location → 502」与「带 Location → 跟随」。
+
+## 2.4 重定向环文案：已对齐（2026-10-16）
+
+上游把请求导进重定向环时，旧实现 `urllib.HTTPRedirectHandler` 抛 `HTTPError`，被外层
+`except` 吞成 `502`。本版此前会把跟随交给 `net/http` 的默认策略（满 10 跳后回
+`stopped after 10 redirects`），文案与旧实现不同；现改用自定义 `http.Client.CheckRedirect`
+（`internal/proxy/redirect.go`）逐值复刻，两版文案已逐字节一致。
+
+**判定语义（逐值复刻 CPython `urllib`）**：跟踪器记录每个重定向目标被跟随的次数，
+在跟随下一跳之前判定——同一 URL 已访问次数达 `max_repeats = 4`，或累计不同 URL 数达
+`max_redirections = 10`，即抛出与旧实现等价的错误；否则记一次并继续跟随。刻意**不在
+「第一次重复」时就判环**：`urllib` 因 cookie 等有状态重定向留了重复余量，照搬「重复即环」
+会把「合法地回到某个 URL 一两次」误判成环（这也是需求书要求的「非环普通重定向行为不变」）。
+
+**文案格式**（`internal/httpx.RedirectLoopError`，等价于旧实现 `HTTPError.__str__`，
+含两处真实换行，`json.dumps` 转义为字面 `\n`）：
+
+```
+upstream failed: HTTP Error <code>: The HTTP server returned a redirect error that would lead to an infinite loop.
+The last 30x error message was:
+<reason>
+```
+
+`<code>` 取触发判环那一次 3xx 的状态码；`<reason>` 取它状态行的原样短语，空则按 §2.3
+的标准表兜底。并排对照（同一环上游兼出口代理，旧 = 同源副本 `19393`、
+新缓冲 `19287`、新流式 `19288`；复现命令 `bash .acceptance/redirect-parity.sh`，
+原始输出 `.acceptance/redirect-parity.out`）：
+
+| 用例 | 环形态 | 旧（19393） | 新缓冲（19287） | 新流式（19288） | 结论 |
+|---|---|---|---|---|---|
+| 自环 | `/v1/self` 302 → 自身 | 502 `HTTP Error 302: …Found` | 同左 | 同左 | 逐字节一致 |
+| 抖动环 | 302 → 303 → 302 → … | 502 `HTTP Error 302: …Found` | 同左 | 同左 | 逐字节一致 |
+| 非标准 reason | `302 Weird` 自环 | 502 `HTTP Error 302: …Weird` | 同左 | 同左 | 逐字节一致 |
+| 超跟随上限 | `/v1/rN` 不重复链 > 10 | 502 `HTTP Error 302: …Found` | 同左 | 同左 | 逐字节一致 |
+| 普通单跳 | 302 → 200 | 200 `final-body` | 同左 | 同左 | 未回退到 502 |
+| 普通双跳 | 301 → 302 → 200 | 200 `final-body` | 同左 | 同左 | 未回退到 502 |
+
+跟随次数同样对齐旧实现（真机 Python 探针与 Go 单测一致）：自环 5 次、302/303 抖动 9 次、
+不重复超限 11 次。单测 `internal/proxy` 的 `TestRedirectSelfLoopMatchesOld`、
+`TestRedirectJitterLoopMatchesOld`、`TestRedirectDistinctChainCapMatchesOld`、
+`TestRedirectLoopReasonTakenVerbatim`、`TestRedirectChainStillFollowed`，
+以及 `internal/httpx.TestRedirectLoopErrorMatchesPython`。
+
+> 说明：环上游在并排脚本里直接充当出口代理，而非经 `tools/fakeproxy`——Go 的 `net/http`
+> 写响应时会把自定义 reason 归一化成标准短语，会掩盖「环里的 reason 原样取用」这一项。
+
+至此，**上游按 HTTP 应答与重定向环的 502 文案已全部对齐**；唯一仍无法逐字节对齐的一类
+只剩非 HTTP 异常（不可达 / 超时 / TLS）。
 
 ## 3. 唯一有意差异：MUSE_STREAM
 
