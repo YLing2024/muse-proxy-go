@@ -12,8 +12,8 @@
 | 2 | 去掉前导 `/v1` 再拼上游 base | `stripV1`：`strings.HasPrefix(path, "/v1")` 则裁剪，与旧实现同源；query 保留。 |
 | 3 | 白名单三分支 | 见下节「白名单」。 |
 | 4 | 请求头过滤 + 覆盖 Authorization | 丢弃 `host` / `content-length` / `connection` / `authorization`，其余透传，`Authorization` 覆盖为 `Bearer <key>`。 |
-| 5 | 响应头过滤 + 自设 Content-Length | 丢弃 `transfer-encoding` / `connection` / `content-length`，状态码透传，缓冲模式自设 `Content-Length`。 |
-| 6 | 上游失败/超时 → 502 | 所有转发期错误回 `502`，message 前缀 `upstream failed: `。 |
+| 5 | 响应头过滤 + 自设 Content-Length | 丢弃 `transfer-encoding` / `connection` / `content-length`，**状态码透传**，缓冲模式自设 `Content-Length`（旧实现实际会把 4xx/5xx 变 502，见 §2.1）。 |
+| 6 | 上游失败/超时 → 502 | 转发链路失败（不可达、超时）回 `502`，message 前缀 `upstream failed: `；上游正常返回的 4xx/5xx 不算失败、原样透传。 |
 | 7 | 五方法同处理器，其余 501 | `routeTable` 登记 GET/POST/PUT/DELETE/HEAD；未登记方法回 `501` 且不转发。 |
 | 8 | 上游超时 120 秒 | `MUSE_TIMEOUT` 默认 `120s`。 |
 | 9 | key 读取顺序，`!` 占位无效 | `env → PI_MODELS_JSON → OPENCODE_AUTH_JSON`，`!` 前缀跳过；仅启动读一次。 |
@@ -52,6 +52,23 @@
 | 响应 `Date` / `Server` 头 | 旧实现会同时发自身的与上游的两份 `Date`/`Server` | 只保留上游的 `Date`，不发自身 `Server` | 非关键头，客户端忽略。 |
 | 自动 gzip | 不透明解压 | `DisableCompression=true`，同样不透明解压、不擅自加 `Accept-Encoding` | 行为一致（已显式对齐）。 |
 | 响应头重复值 | `email.message` 可能合并重复头 | 逐个 `Add` 保留 | 语义一致。 |
+| 上游请求头附加项 | `urllib` 额外加 `Accept-Encoding: identity`、`Connection: close`，无 body 时还会加 `Content-Type: application/x-www-form-urlencoded` | 纯透传（只转发客户端实际带的头） | 需求书 §2.4 要求「其余原样透传」，故不复制 urllib 的运行时默认头；上游可见的额外头不同。 |
+| 重定向 | `urllib` 默认跟随 301/302/303/307 | `net/http` 默认跟随 301/302/303/307/308 | 两者都跟随重定向，边界（跨主机是否携带 Authorization）略有差异。 |
+
+## 2.1 旧实现自身与需求书不一致处（本版按需求书实现）
+
+并行对照时发现一处**旧实现的可观测行为与需求书矛盾**，本版以需求书为准：
+
+- 需求书 §2.5 要求「状态码取上游状态码」、§6.4 要求「上游 5xx 原样回传」。
+- 但旧实现用 `urllib.request.OpenerDirector.open()`，其 `HTTPErrorProcessor` 对**所有非 2xx/3xx**
+  状态抛 `HTTPError`，被 `except` 捕获后回 **502** `upstream failed: HTTP Error <code>: <reason>`。
+  即：旧实现**不会**把上游的 4xx/5xx 透传，而是统一变成 502。
+- 本版实现**状态码透传**（`503` 就回 `503`），符合需求书 §2.5 / §6.4。
+  并排对照矩阵的 `c7`（上游 `X-Fake-Status: 503`）会显示：
+  旧 `502 upstream failed: HTTP Error 503: Service Unavailable`、新 `503` 且响应体为上游内容。
+
+> 这是本次重写发现的旧实现缺陷，不是本版新增的差异；如需与旧版逐字节一致地「把 4xx/5xx 变成 502」，
+> 需要产品方确认后另行改需求书。
 
 ## 3. 唯一有意差异：MUSE_STREAM
 
