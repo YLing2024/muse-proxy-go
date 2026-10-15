@@ -25,7 +25,7 @@ func (e *RedirectLoopError) Error() string {
 }
 
 // NewRedirectLoopError 依据触发环判定那一次 3xx 的状态码与状态行构造错误；
-// reason 的取值与上游 502 文案同一规则（原样短语，空则标准表兜底）。
+// reason 的取值与上游 502 文案同一规则（原样短语，未给短语时为空串）。
 func NewRedirectLoopError(code int, statusLine string) *RedirectLoopError {
-	return &RedirectLoopError{Code: code, Reason: StatusLineReason(code, statusLine)}
+	return &RedirectLoopError{Code: code, Reason: StatusLineReason(statusLine)}
 }

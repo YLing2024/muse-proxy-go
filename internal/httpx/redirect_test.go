@@ -28,11 +28,11 @@ func TestRedirectLoopErrorMatchesPython(t *testing.T) {
 				"The last 30x error message was:\nWeird",
 		},
 		{
-			"状态行未给短语则兜底",
+			"状态行未给短语则留空",
 			302,
 			"302",
 			"HTTP Error 302: The HTTP server returned a redirect error that would lead to an infinite loop.\n" +
-				"The last 30x error message was:\nFound",
+				"The last 30x error message was:\n",
 		},
 	}
 	for _, c := range cases {

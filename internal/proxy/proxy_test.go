@@ -359,7 +359,7 @@ func rawStatusUpstream(t *testing.T, statusLine string) string {
 
 // TestUpstreamReasonPhraseTakenVerbatim 验证 502 文案里的 `<reason>` 取自上游
 // 状态行的原样短语（含非标准短语），与旧实现 urllib 的可观测文案逐字节一致；
-// 上游未给短语时才回落到标准表。
+// 上游未给短语时留空串（旧实现同样如此，不回落到标准表）。
 func TestUpstreamReasonPhraseTakenVerbatim(t *testing.T) {
 	cases := []struct {
 		name       string
@@ -368,7 +368,7 @@ func TestUpstreamReasonPhraseTakenVerbatim(t *testing.T) {
 	}{
 		{"非标准短语 413", "413 Nope", `{"type": "error", "error": {"message": "upstream failed: HTTP Error 413: Nope"}}`},
 		{"非标准短语 599", "599 Weird", `{"type": "error", "error": {"message": "upstream failed: HTTP Error 599: Weird"}}`},
-		{"码后只有空白回落标准表", "500 ", `{"type": "error", "error": {"message": "upstream failed: HTTP Error 500: Internal Server Error"}}`},
+		{"码后只有空白则留空", "500 ", `{"type": "error", "error": {"message": "upstream failed: HTTP Error 500: "}}`},
 	}
 	for _, c := range cases {
 		raw := rawStatusUpstream(t, c.statusLine)

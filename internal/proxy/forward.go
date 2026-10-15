@@ -99,11 +99,11 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, b
 
 // upstreamHTTPErrorMessage 复刻旧实现把上游非 2xx（4xx/5xx，以及未被跟随的 3xx）
 // 变成 502 时的内层文案：`upstream failed: HTTP Error <code>: <reason>`。
-// reason 优先取上游状态行里的原样短语，仅在上游未给短语时回落到标准表；
+// reason 取上游状态行里的原样短语（上游未给短语时为空串，旧实现同样留空）；
 // 取值逻辑见 httpx.StatusLineReason。
 func upstreamHTTPErrorMessage(resp *http.Response) string {
 	return "upstream failed: HTTP Error " + strconv.Itoa(resp.StatusCode) + ": " +
-		httpx.StatusLineReason(resp.StatusCode, resp.Status)
+		httpx.StatusLineReason(resp.Status)
 }
 
 // bufferedResponse 是默认模式：整段读完后自设 Content-Length 回传（与旧实现可观测行为一致）。
