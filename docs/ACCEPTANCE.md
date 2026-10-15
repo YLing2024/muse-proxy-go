@@ -296,27 +296,7 @@ RECV HEAD   http://afterrun.example/v1/models     HTTP/1.1 content-length=0
 
 复现命令：`bash .acceptance/parity.sh`（原始输出见 `.acceptance/parity.out`）。
 
-| 上游 `X-Fake-Status` | 旧（19393） | 新缓冲（19287） | 新流式（19288） | 结论 |
-|---|---|---|---|---|
-| 200 / 201 | 200 / 201 | 200 / 201 | 200 / 201 | 一致（2xx 不受影响） |
-| 400 | 502 `HTTP Error 400: Bad Request` | 同左 | 同左 | 逐字节一致 |
-| 401 | 502 `HTTP Error 401: Unauthorized` | 同左 | 同左 | 逐字节一致 |
-| 403 | 502 `HTTP Error 403: Forbidden` | 同左 | 同左 | 逐字节一致 |
-| 404 | 502 `HTTP Error 404: Not Found` | 同左 | 同左 | 逐字节一致 |
-| 405 | 502 `HTTP Error 405: Method Not Allowed` | 同左 | 同左 | 逐字节一致 |
-| 409 | 502 `HTTP Error 409: Conflict` | 同左 | 同左 | 逐字节一致 |
-| 422 | 502 `HTTP Error 422: Unprocessable Entity` | 同左 | 同左 | 逐字节一致 |
-| 429 | 502 `HTTP Error 429: Too Many Requests` | 同左 | 同左 | 逐字节一致 |
-| 500 | 502 `HTTP Error 500: Internal Server Error` | 同左 | 同左 | 逐字节一致 |
-| 502 | 502 `HTTP Error 502: Bad Gateway` | 同左 | 同左 | 逐字节一致 |
-| 503 | 502 `HTTP Error 503: Service Unavailable` | 同左 | 同左 | 逐字节一致 |
-| 504 | 502 `HTTP Error 504: Gateway Timeout` | 同左 | 同左 | 逐字节一致 |
-| 413 | 502 `HTTP Error 413: Request Entity Too Large` | 502 `... 413: Payload Too Large` | 同左 | **文案不同**（旧取上游状态行短语，本版取标准表；见 `COMPAT.md` §2.3） |
-| 414 | 502 `... 414: Request URI Too Long` | 502 `... 414: URI Too Long` | 同左 | 文案不同（同上） |
-| 416 | 502 `... 416: Requested Range Not Satisfiable` | 502 `... 416: Range Not Satisfiable` | 同左 | 文案不同（同上） |
-| 418 | 502 `... 418: I'm a teapot` | 502 `... 418: I'm a Teapot` | 同左 | 文案不同（同上） |
-| 599（未收录） | 502 `... 599: status code 599` | 502 `... 599: Unknown` | 同左 | 文案不同（同上） |
-| 302（无 Location） | 502 `... 302: Found` | 302 原样 | 302 原样 | 3xx 透传（需求书 §2.6）；带 Location 时两者都跟随 |
+完整并排矩阵（含不一致项判定）见 `docs/COMPAT.md` §2.1，此处只留原始输出节选。
 
 原始输出（节选）：
 

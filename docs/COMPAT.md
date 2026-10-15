@@ -77,8 +77,34 @@ GET  /v1/does-not-exist（上游回 404 Not Found）      → 旧实现回 502
   {"type": "error", "error": {"message": "upstream failed: HTTP Error 404: Not Found"}}
 ```
 
-并排对照（同一假上游、同一请求矩阵）见 `docs/ACCEPTANCE.md` §12；`400/401/403/404/405/409/422/429/500/502/503/504`
-逐字节一致。
+并排对照（同一假上游 `tools/fakeupstream`、同一假出口代理 `tools/fakeproxy`、同一请求矩阵；
+旧 = `/usr/local/bin/muse-proxy.py` 同源副本 `19393`，新缓冲 `19287`，新流式 `19288`；
+复现命令 `bash .acceptance/parity.sh`，原始输出 `.acceptance/parity.out`）：
+
+| 上游 `X-Fake-Status` | 旧（19393） | 新缓冲（19287） | 新流式（19288） | 结论 |
+|---|---|---|---|---|
+| 200 / 201 | 200 / 201 | 200 / 201 | 200 / 201 | 一致（2xx 不受影响） |
+| 400 | 502 `HTTP Error 400: Bad Request` | 同左 | 同左 | 逐字节一致 |
+| 401 | 502 `HTTP Error 401: Unauthorized` | 同左 | 同左 | 逐字节一致 |
+| 403 | 502 `HTTP Error 403: Forbidden` | 同左 | 同左 | 逐字节一致 |
+| 404 | 502 `HTTP Error 404: Not Found` | 同左 | 同左 | 逐字节一致 |
+| 405 | 502 `HTTP Error 405: Method Not Allowed` | 同左 | 同左 | 逐字节一致 |
+| 409 | 502 `HTTP Error 409: Conflict` | 同左 | 同左 | 逐字节一致 |
+| 422 | 502 `HTTP Error 422: Unprocessable Entity` | 同左 | 同左 | 逐字节一致 |
+| 429 | 502 `HTTP Error 429: Too Many Requests` | 同左 | 同左 | 逐字节一致 |
+| 500 | 502 `HTTP Error 500: Internal Server Error` | 同左 | 同左 | 逐字节一致 |
+| 502 | 502 `HTTP Error 502: Bad Gateway` | 同左 | 同左 | 逐字节一致 |
+| 503 | 502 `HTTP Error 503: Service Unavailable` | 同左 | 同左 | 逐字节一致 |
+| 504 | 502 `HTTP Error 504: Gateway Timeout` | 同左 | 同左 | 逐字节一致 |
+| 413 | 502 `... 413: Request Entity Too Large` | 502 `... 413: Payload Too Large` | 同左 | 文案不同（见 §2.3） |
+| 414 | 502 `... 414: Request URI Too Long` | 502 `... 414: URI Too Long` | 同左 | 文案不同（见 §2.3） |
+| 416 | 502 `... 416: Requested Range Not Satisfiable` | 502 `... 416: Range Not Satisfiable` | 同左 | 文案不同（见 §2.3） |
+| 418 | 502 `... 418: I'm a teapot` | 502 `... 418: I'm a Teapot` | 同左 | 文案不同（见 §2.3） |
+| 599（未收录） | 502 `... 599: status code 599` | 502 `... 599: Unknown` | 同左 | 文案不同（见 §2.3） |
+| 302（无 `Location`） | 502 `... 302: Found` | 302 原样 | 302 原样 | 3xx 透传（需求书 §2.6）；带 `Location` 时两者都跟随 |
+
+常见码 `400/401/403/404/405/409/422/429/500/502/503/504` 逐字节一致；其余不可对齐项均在 §2.3 记明。
+非 HTTP 异常（不可达 / 超时）仍回 502、前缀 `upstream failed: `，文案为 Go 措辞（§2 表首行）。
 
 ## 2.2 已对齐的两处旧实现行为（2026-10-16 修复）
 
