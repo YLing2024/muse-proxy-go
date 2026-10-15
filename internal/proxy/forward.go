@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"net/http"
 	"strconv"
@@ -18,8 +19,8 @@ var droppedResponseHeaders = map[string]bool{
 	"content-length":    true,
 }
 
-// forward 把请求转发到上游并把响应回传。转发期错误（不可达/超时等）与上游 4xx/5xx
-// 都归为 502，message 前缀 upstream failed（复刻旧实现，见 §2.6）。
+// forward 把请求转发到上游并把响应回传。转发期错误（不可达/超时等）、上游 4xx/5xx，
+// 以及重定向环，都归为 502，message 前缀 upstream failed（复刻旧实现，见 §2.6）。
 func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, body []byte) {
 	var reader io.Reader
 	if len(body) > 0 {
@@ -51,8 +52,21 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, b
 		req.Header["content-length"] = []string{"0"}
 	}
 
-	resp, err := p.client.Do(req)
+	// 每次转发复制一个 client 并装上独立的重定向跟踪器：http.Client 是轻量句柄，
+	// 复制后仍共享底层 Transport，而 CheckRedirect 携带的访问记录只属本次请求，
+	// 天然并发安全（绝不能把跟踪状态挂到共享的 p.client 上）。
+	client := *p.client
+	client.CheckRedirect = newRedirectTracker().check
+
+	resp, err := client.Do(req)
 	if err != nil {
+		// 重定向环是旧实现里可观测的一段固定文案，逐字节复刻；其余转发期错误
+		// （不可达/超时/TLS 等非 HTTP 异常）仍用 Go 运行时措辞。
+		var loopErr *httpx.RedirectLoopError
+		if errors.As(err, &loopErr) {
+			httpx.WriteError(w, http.StatusBadGateway, "upstream failed: "+loopErr.Error())
+			return
+		}
 		httpx.WriteError(w, http.StatusBadGateway, "upstream failed: "+err.Error())
 		return
 	}
@@ -66,7 +80,8 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, b
 	// `upstream failed: HTTP Error <code>: <reason>`。
 	//
 	// 因此这里把「到达本层的非 2xx」一律回 502（不是透传），只有 2xx 才照旧回传；
-	// 能到达本层的 3xx 一定没被 Go 客户端跟随，与旧实现一致。
+	// 能到达本层的 3xx 一定没被 Go 客户端跟随，与旧实现一致。（重定向环由
+	// CheckRedirect 在上一步拦下并按旧实现文案回 502，不会到达此处。）
 	//
 	// 该判定必须发生在任何响应头落盘之前，流式模式下同样如此：能到这里说明上游
 	// 尚未提交 2xx，故流式档也把非 2xx 变 502，与缓冲档一致。
