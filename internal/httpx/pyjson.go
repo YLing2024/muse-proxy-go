@@ -3,6 +3,7 @@ package httpx
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
@@ -86,7 +87,16 @@ func pyNumber(lit string) string {
 }
 
 // pyFloat 让浮点输出带小数点，贴近 Python str(float) 的观感（如 1.0 而非 1）。
+// NaN/±Inf 的文案单独对齐（Python 是 nan/inf/-inf，而非 Go 的 NaN/+Inf）。
 func pyFloat(f float64) string {
+	switch {
+	case math.IsNaN(f):
+		return "nan"
+	case math.IsInf(f, 1):
+		return "inf"
+	case math.IsInf(f, -1):
+		return "-inf"
+	}
 	s := strconv.FormatFloat(f, 'g', -1, 64)
 	if !strings.ContainsAny(s, ".eE") {
 		s += ".0"
