@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bufio"
 	"bytes"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"regexp"
@@ -245,7 +247,9 @@ func TestResponsePassthrough(t *testing.T) {
 
 // TestUpstreamErrorStatusBecomes502 复刻旧实现：上游 4xx/5xx 一律回 502，
 // 错误体逐字节等于 `{"type": "error", "error": {"message": "upstream failed: HTTP Error <code>: <reason>"}}`。
-// 状态码与响应体取自需求书 §2.6；reason 取自 Python `http.client.responses`。
+// 这里的假上游是 Go 的 httptest，其状态行短语即 Go `net/http` 的 `StatusText`；
+// 旧实现（urllib）读到的正是同一批短语，故两者逐字节一致。599 未收录，
+// Go 服务端按 `status code <code>` 兜底，旧实现同样照抄。
 func TestUpstreamErrorStatusBecomes502(t *testing.T) {
 	cases := []struct {
 		code   int
@@ -257,14 +261,14 @@ func TestUpstreamErrorStatusBecomes502(t *testing.T) {
 		{404, "Not Found"},
 		{405, "Method Not Allowed"},
 		{409, "Conflict"},
-		{413, "Payload Too Large"},
+		{413, "Request Entity Too Large"},
 		{422, "Unprocessable Entity"},
 		{429, "Too Many Requests"},
 		{500, "Internal Server Error"},
 		{502, "Bad Gateway"},
 		{503, "Service Unavailable"},
 		{504, "Gateway Timeout"},
-		{599, "Unknown"},
+		{599, "status code 599"},
 	}
 	for _, c := range cases {
 		c := c
@@ -314,6 +318,128 @@ func TestStreamingUpstreamErrorBecomes502(t *testing.T) {
 	}
 	if cl := resp.Header.Get("Content-Length"); cl != strconv.Itoa(len(want)) {
 		t.Fatalf("流式档 502 应带正确 Content-Length，得到 %q", cl)
+	}
+}
+
+// rawStatusUpstream 用一个只回「固定原文状态行」的裸 TCP 服务冒充出口代理/上游。
+// Go 的 httptest 无法自定义 reason 短语，故用裸连接验证「reason 取上游原样」。
+// 返回其地址，调用方把它塞进 cfg.ProxyURL 即可（本代理把绝对形式请求发给它）。
+func rawStatusUpstream(t *testing.T, statusLine string) string {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("裸上游监听失败：%v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer c.Close()
+				br := bufio.NewReader(c)
+				for { // 读到请求头结束再回包，避免客户端写请求时收到 RST。
+					line, err := br.ReadString('\n')
+					if err != nil {
+						return
+					}
+					if line == "\r\n" {
+						break
+					}
+				}
+				resp := "HTTP/1.1 " + statusLine + "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+				_, _ = io.WriteString(c, resp)
+			}(conn)
+		}
+	}()
+	return "http://" + ln.Addr().String()
+}
+
+// TestUpstreamReasonPhraseTakenVerbatim 验证 502 文案里的 `<reason>` 取自上游
+// 状态行的原样短语（含非标准短语），与旧实现 urllib 的可观测文案逐字节一致；
+// 上游未给短语时才回落到标准表。
+func TestUpstreamReasonPhraseTakenVerbatim(t *testing.T) {
+	cases := []struct {
+		name       string
+		statusLine string
+		want       string
+	}{
+		{"非标准短语 413", "413 Nope", `{"type": "error", "error": {"message": "upstream failed: HTTP Error 413: Nope"}}`},
+		{"非标准短语 599", "599 Weird", `{"type": "error", "error": {"message": "upstream failed: HTTP Error 599: Weird"}}`},
+		{"码后只有空白回落标准表", "500 ", `{"type": "error", "error": {"message": "upstream failed: HTTP Error 500: Internal Server Error"}}`},
+	}
+	for _, c := range cases {
+		raw := rawStatusUpstream(t, c.statusLine)
+		srv, _ := newTestProxy(t, &config.Config{ProxyURL: raw}, newFakeProxy(t, okResponder))
+
+		resp, body := doReq(t, srv.URL, "POST", "/v1/chat/completions", `{"model":"muse-spark-1.3-contributor"}`, nil)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("%s：应回 502，得到 %d", c.name, resp.StatusCode)
+			continue
+		}
+		if body != c.want {
+			t.Errorf("%s：错误体不一致：\n got=%s\nwant=%s", c.name, body, c.want)
+		}
+	}
+}
+
+// TestRedirectWithoutLocationBecomes502 复刻旧实现：3xx 不带 `Location` 时，
+// urllib 抛 `HTTPError` 被 `except` 吞掉 → 502，文案同为
+// `upstream failed: HTTP Error <code>: <reason>`。本版 3xx 若未被 Go 客户端跟随，
+// 同样回 502（302 无 Location 与 304 都不会被跟随）。
+func TestRedirectWithoutLocationBecomes502(t *testing.T) {
+	cases := []struct {
+		code   int
+		reason string
+	}{
+		{http.StatusFound, "Found"},
+		{http.StatusNotModified, "Not Modified"},
+	}
+	for _, c := range cases {
+		code := c.code
+		fp := newFakeProxy(t, func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(code)
+		})
+		srv, _ := newTestProxy(t, &config.Config{}, fp)
+
+		resp, body := doReq(t, srv.URL, "POST", "/v1/chat/completions", `{"model":"muse-spark-1.3-contributor"}`, nil)
+		if resp.StatusCode != http.StatusBadGateway {
+			t.Errorf("上游 %d 无 Location 应回 502，得到 %d", code, resp.StatusCode)
+			continue
+		}
+		want := `{"type": "error", "error": {"message": "upstream failed: HTTP Error ` +
+			strconv.Itoa(code) + `: ` + c.reason + `"}}`
+		if body != want {
+			t.Errorf("上游 %d 无 Location 错误体不一致：\n got=%s\nwant=%s", code, body, want)
+		}
+	}
+}
+
+// TestRedirectWithLocationIsFollowed 验证带 `Location` 的 3xx 仍按旧实现跟随重定向：
+// 上游首跳 302 指向同主机的新路径，最终 200 与其响应体原样回传。
+func TestRedirectWithLocationIsFollowed(t *testing.T) {
+	fp := newFakeProxy(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/v1/final" {
+			w.Header().Set("X-Final", "yes")
+			_, _ = io.WriteString(w, "landed")
+			return
+		}
+		w.Header().Set("Location", "http://upstream.example/v1/final")
+		w.WriteHeader(http.StatusFound)
+	})
+	srv, _ := newTestProxy(t, &config.Config{}, fp)
+
+	resp, body := doReq(t, srv.URL, "POST", "/v1/chat/completions", `{"model":"muse-spark-1.3-contributor"}`, nil)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("带 Location 的 302 应跟随到 200，得到 %d", resp.StatusCode)
+	}
+	if body != "landed" || resp.Header.Get("X-Final") != "yes" {
+		t.Fatalf("跟随重定向后应回传最终响应，得到 body=%q header=%q", body, resp.Header.Get("X-Final"))
+	}
+	if fp.count() < 2 {
+		t.Fatalf("应发生一次重定向（至少两次上游请求），实际 %d", fp.count())
 	}
 }
 

@@ -58,14 +58,20 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, b
 	}
 	defer resp.Body.Close()
 
-	// 复刻旧实现：urllib 的 HTTPErrorProcessor 对所有非 2xx/3xx 抛 HTTPError，被
-	// 外层 except 吞掉后统一 _reply(502)，文案为 upstream failed: HTTP Error <code>: <reason>。
-	// 因此上游 4xx/5xx 一律回 502（不是透传），2xx/3xx 才照旧回传。
+	// 复刻旧实现：urllib 的 HTTPErrorProcessor 对**所有非 2xx/3xx** 抛 HTTPError，
+	// 只有 2xx 会被 `opener.open()` 正常返回；3xx 里带 Location 的由
+	// HTTPRedirectHandler 跟随（Go 客户端同理由 Transport 跟随），而**没被跟随的
+	// 3xx**（无 Location，或 300/304 等不跟随的码）同样落到错误处理器，被外层
+	// `except` 吞掉后统一 _reply(502)，文案为
+	// `upstream failed: HTTP Error <code>: <reason>`。
+	//
+	// 因此这里把「到达本层的非 2xx」一律回 502（不是透传），只有 2xx 才照旧回传；
+	// 能到达本层的 3xx 一定没被 Go 客户端跟随，与旧实现一致。
 	//
 	// 该判定必须发生在任何响应头落盘之前，流式模式下同样如此：能到这里说明上游
-	// 尚未提交 2xx，故流式档也把 4xx/5xx 变 502，与缓冲档一致。
-	if resp.StatusCode >= http.StatusBadRequest {
-		httpx.WriteError(w, http.StatusBadGateway, upstreamHTTPErrorMessage(resp.StatusCode))
+	// 尚未提交 2xx，故流式档也把非 2xx 变 502，与缓冲档一致。
+	if resp.StatusCode >= http.StatusMultipleChoices {
+		httpx.WriteError(w, http.StatusBadGateway, upstreamHTTPErrorMessage(resp))
 		return
 	}
 
@@ -76,10 +82,13 @@ func (p *Proxy) forward(w http.ResponseWriter, r *http.Request, target string, b
 	p.bufferedResponse(w, resp)
 }
 
-// upstreamHTTPErrorMessage 复刻旧实现把上游 4xx/5xx 变成 502 时的内层文案：
-// `upstream failed: HTTP Error <code>: <reason>`，reason 取 Python 标准原因短语。
-func upstreamHTTPErrorMessage(code int) string {
-	return "upstream failed: HTTP Error " + strconv.Itoa(code) + ": " + httpx.ReasonPhrase(code)
+// upstreamHTTPErrorMessage 复刻旧实现把上游非 2xx（4xx/5xx，以及未被跟随的 3xx）
+// 变成 502 时的内层文案：`upstream failed: HTTP Error <code>: <reason>`。
+// reason 优先取上游状态行里的原样短语，仅在上游未给短语时回落到标准表；
+// 取值逻辑见 httpx.StatusLineReason。
+func upstreamHTTPErrorMessage(resp *http.Response) string {
+	return "upstream failed: HTTP Error " + strconv.Itoa(resp.StatusCode) + ": " +
+		httpx.StatusLineReason(resp.StatusCode, resp.Status)
 }
 
 // bufferedResponse 是默认模式：整段读完后自设 Content-Length 回传（与旧实现可观测行为一致）。
