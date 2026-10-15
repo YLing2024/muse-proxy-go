@@ -12,8 +12,8 @@
 | 2 | 去掉前导 `/v1` 再拼上游 base | `stripV1`：`strings.HasPrefix(path, "/v1")` 则裁剪，与旧实现同源；query 保留。 |
 | 3 | 白名单三分支 | 见下节「白名单」。`400` 内层文案复刻 Python `json` 模块的 `JSONDecodeError`（行列 / `char` 偏移逐字节一致，见 §2.2）。 |
 | 4 | 请求头过滤 + 覆盖 Authorization | 丢弃 `host` / `content-length` / `connection` / `authorization`，其余透传，`Authorization` 覆盖为 `Bearer <key>`；空 body 时向上游补发 `Content-Length: 0`（对齐旧实现 `data=b""`，见 §2.2）。 |
-| 5 | 响应头过滤 + 自设 Content-Length | 丢弃 `transfer-encoding` / `connection` / `content-length`，**状态码透传**，缓冲模式自设 `Content-Length`（旧实现实际会把 4xx/5xx 变 502，见 §2.1）。 |
-| 6 | 上游失败/超时 → 502 | 转发链路失败（不可达、超时）回 `502`，message 前缀 `upstream failed: `；上游正常返回的 4xx/5xx 不算失败、原样透传。 |
+| 5 | 响应头过滤 + 自设 Content-Length | 丢弃 `transfer-encoding` / `connection` / `content-length`，缓冲模式自设 `Content-Length`；**2xx/3xx 状态码透传，4xx/5xx 一律回 502**（复刻旧实现，见 §2.1）。 |
+| 6 | 上游失败/超时 → 502 | 转发链路失败（不可达、超时、TLS 失败等非 HTTP 异常）回 `502`，message 前缀 `upstream failed: `；上游返回的 4xx/5xx 同样回 `502`（见 §2.1）。 |
 | 7 | 五方法同处理器，其余 501 | `routeTable` 登记 GET/POST/PUT/DELETE/HEAD；未登记方法回 `501` 且不转发。 |
 | 8 | 上游超时 120 秒 | `MUSE_TIMEOUT` 默认 `120s`。 |
 | 9 | key 读取顺序，`!` 占位无效 | `env → PI_MODELS_JSON → OPENCODE_AUTH_JSON`，`!` 前缀跳过；仅启动读一次。 |
@@ -46,7 +46,7 @@
 
 | 项 | 旧实现（Python） | 本版（Go） | 影响 |
 |---|---|---|---|
-| `502` 内层文案 | `upstream failed: <urlopen error [Errno 111] ...>` | `upstream failed: <Go net/http 错误>` | 前缀与状态码一致，错误文本不同。 |
+| `502` 内层文案（非 HTTP 异常：不可达/超时/TLS 失败） | `upstream failed: <urlopen error [Errno 111] ...>` | `upstream failed: <Go net/http 错误>` | 前缀与状态码一致，错误文本不同（唯一无法逐字节对齐的一类）。 |
 | `501` 响应体 | `send_error` 生成的 HTML 错误页 | 纯文本 `unsupported method` | 状态码一致，体不同。 |
 | 请求头大小写 | `urllib` 会把头名 `capitalize`（如 `Content-type`） | `net/http` 规范化为 `Content-Type` | HTTP 头名大小写不敏感，语义一致。 |
 | 同名请求头 | 收进 dict，只保留最后一个值 | 同样只保留最后一个值 | 语义一致（已显式对齐）。 |
@@ -56,20 +56,29 @@
 | 上游请求头附加项 | `urllib` 额外加 `Accept-Encoding: identity`、`Connection: close`，无 body 时还会加 `Content-Type: application/x-www-form-urlencoded` | 纯透传（只转发客户端实际带的头），空 body 时补 `Content-Length: 0` | 需求书 §2.4 要求「其余原样透传」，故不复制 urllib 的运行时默认头；上游可见的额外头不同。 |
 | 重定向 | `urllib` 默认跟随 301/302/303/307 | `net/http` 默认跟随 301/302/303/307/308 | 两者都跟随重定向，边界（跨主机是否携带 Authorization）略有差异。 |
 
-## 2.1 旧实现自身与需求书不一致处（本版按需求书实现）
+## 2.1 状态码口径：复刻旧实现的 502（2026-10-16 定案）
 
-并行对照时发现一处**旧实现的可观测行为与需求书矛盾**，本版以需求书为准：
+上一轮曾按当时的需求书实现「4xx/5xx 透传」，并据此列出旧实现与之矛盾。**需求书 §2.6 / §6.4
+已按旧实现实测改定**：以旧实现可观测行为为准，上游 4xx/5xx **一律回 502**。本版现已对齐。
 
-- 需求书 §2.5 要求「状态码取上游状态码」、§6.4 要求「上游 5xx 原样回传」。
-- 但旧实现用 `urllib.request.OpenerDirector.open()`，其 `HTTPErrorProcessor` 对**所有非 2xx/3xx**
-  状态抛 `HTTPError`，被 `except` 捕获后回 **502** `upstream failed: HTTP Error <code>: <reason>`。
-  即：旧实现**不会**把上游的 4xx/5xx 透传，而是统一变成 502。
-- 本版实现**状态码透传**（`503` 就回 `503`），符合需求书 §2.5 / §6.4。
-  并排对照矩阵的 `c7`（上游 `X-Fake-Status: 503`）会显示：
-  旧 `502 upstream failed: HTTP Error 503: Service Unavailable`、新 `503` 且响应体为上游内容。
+- 旧实现用 `urllib.request.OpenerDirector.open()`，其 `HTTPErrorProcessor` 对**所有非 2xx/3xx**
+  状态抛 `HTTPError`，被 `except` 吞掉后回 **502** `upstream failed: HTTP Error <code>: <reason>`。
+- 本版在响应头落盘前判定：`resp.StatusCode >= 400` → **502**，体为
+  `{"type": "error", "error": {"message": "upstream failed: HTTP Error <code>: <reason>"}}`，
+  `Content-Type: application/json`、`Content-Length` 自算。**2xx/3xx 照旧透传**。
+  缓冲档与 `MUSE_STREAM=1` 流式档走同一判定，语义一致（见 §3）。
 
-> 这是本次重写发现的旧实现缺陷，不是本版新增的差异；如需与旧版逐字节一致地「把 4xx/5xx 变成 502」，
-> 需要产品方确认后另行改需求书。
+现网 8787（旧实现）实测座实：
+
+```
+POST /v1/chat/completions（上游回 400 Bad Request） → 旧实现回 502
+  {"type": "error", "error": {"message": "upstream failed: HTTP Error 400: Bad Request"}}
+GET  /v1/does-not-exist（上游回 404 Not Found）      → 旧实现回 502
+  {"type": "error", "error": {"message": "upstream failed: HTTP Error 404: Not Found"}}
+```
+
+并排对照（同一假上游、同一请求矩阵）见 `docs/ACCEPTANCE.md` §12；`400/401/403/404/405/409/422/429/500/502/503/504`
+逐字节一致。
 
 ## 2.2 已对齐的两处旧实现行为（2026-10-16 修复）
 
@@ -90,6 +99,32 @@
 **未映射形态**：只有带 UTF-16/UTF-32 BOM 的 body（Python `detect_encoding` 会据此选编码）。
 UTF-8（含 UTF-8 BOM、以及 `surrogatepass` 允许的代理区编码）已逐字节对齐。
 
+## 2.3 502 文案里的 `<reason>` 来源与边界
+
+`<reason>` 取自 `internal/httpx.ReasonPhrase`，表以本机 **Python 3.13.5 的
+`http.client.responses`**（即 `http.HTTPStatus` 的 standard reason phrase）逐项生成，未收录的码回
+`Unknown`。两处按需求书 §2.6 列举的经典短语收口：`413 Payload Too Large`、`422 Unprocessable Entity`
+（Python 3.13 的 dict 已按 RFC 9110 改名为 `Content Too Large` / `Unprocessable Content`；本轮取需求书
+列举值，并在此记明）。单测见 `internal/httpx.TestReasonPhraseMatchesPython`。
+
+**一处本质差异**：旧实现（`urllib`）的 reason **取自上游状态行本身**，而不是任何标准表；本版改用标准表。
+因此当上游发的短语与标准表不同时，两者文案不一致。并排对照（假上游 = Go `net/http`）可见：
+
+| 码 | 旧实现（取上游状态行，Go `http.StatusText`） | 本版（标准表） |
+|---|---|---|
+| `413` | `Request Entity Too Large` | `Payload Too Large` |
+| `414` | `Request URI Too Long` | `URI Too Long` |
+| `416` | `Requested Range Not Satisfiable` | `Range Not Satisfiable` |
+| `418` | `I'm a teapot` | `I'm a Teapot` |
+| `599`（未收录） | `status code 599`（Go 对空短语的兜底） | `Unknown` |
+
+需求书 §2.6 明确要求用标准原因短语，故本版取标准表；上表几码属**唯一仍无法逐字节对齐**的一类，
+触发前提是「上游状态行短语 ≠ 标准表」。常见码 `400/401/403/404/405/409/422/429/500/502/503/504`
+在上游用标准短语时逐字节一致（并排对照已验）。
+
+> 另有一处重定向边界：旧实现对**没有 `Location`** 的 302 会抛 `HTTPError` 变成 502，本版按
+> 需求书 §2.6「3xx 透传」原样回 302。带 `Location` 时两者都跟随重定向后取最终状态码。
+
 ## 3. 唯一有意差异：MUSE_STREAM
 
 - 默认（`MUSE_STREAM` 非 `1`）：**整段缓冲**，读完整段后自设 `Content-Length` 回传，
@@ -97,6 +132,8 @@ UTF-8（含 UTF-8 BOM、以及 `surrogatepass` 允许的代理区编码）已逐
 - `MUSE_STREAM=1`：**真流式透传**——不设 `Content-Length`，改用 `chunked`，边收边发，
   SSE 首字节延迟显著下降。
 - 该开关是需求书 §3 允许的唯一增强，默认关闭；两档都有单测与端到端验收。
+- **状态码语义与档位无关**：`MUSE_STREAM=1` 也在响应头落盘前判定上游 4xx/5xx → `502`
+  错误体（此时上游尚未提交 2xx）；能进入流式回传即表示上游已是 2xx。
 - 流式模式下若上游在**响应头之后**中途出错，已提交的状态码无法更改，连接会提前结束；
   这是流式的固有取舍（缓冲模式则会把中途读失败归为 `502`）。
 

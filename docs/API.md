@@ -70,7 +70,7 @@
 - 鉴权：无（见 §1）。
 - 行为：无 body → 直接转发。
 - 示例：`curl -sS "$P/v1/models"`
-- 成功响应：上游状态码与响应体原样回传。
+- 成功响应：上游 2xx/3xx 状态码与响应体原样回传；上游 4xx/5xx → `502`（见 §5）。
 - 副作用：一次上游请求。
 
 ### POST /*
@@ -81,7 +81,7 @@
   （`muse-spark-1.2-contributor`、`muse-spark-1.3-contributor`）；
   不在白名单 → `403`；body 不是合法 JSON → `400`。
 - 示例：`curl -sS "$P/v1/chat/completions" -H 'Content-Type: application/json' -d '{"model":"muse-spark-1.3-contributor","messages":[{"role":"user","content":"hi"}]}'`
-- 成功响应：`200`（上游状态码）与上游响应体。
+- 成功响应：上游 2xx/3xx 状态码与响应体原样回传（常见 `200`）；上游 4xx/5xx → `502`（见 §5）。
 - 错误响应：见 §5。
 - 副作用：一次上游请求。
 
@@ -109,13 +109,18 @@
 | `400` | 请求带 body 但不是合法 JSON，或 JSON 不是对象 | `{"type": "error", "error": {"message": "bad request: <解析信息>"}}` |
 | `403` | body 的 `model` 不在白名单（含缺 `model`、`model` 非字符串） | `{"type": "error", "error": {"message": "model <m> not allowed through proxy"}}`，与旧实现逐字节一致 |
 | `501` | 方法不在路由表内 | 纯文本 `unsupported method`（对齐旧实现的状态码语义） |
-| `502` | 上游/出口代理不可达、超时或转发期出错 | `{"type": "error", "error": {"message": "upstream failed: <错误信息>"}}` |
-| 其它 | 上游返回的状态码 | 原样透传（如上游 `5xx` 不改写） |
+| `502` | 上游/出口代理不可达、超时等转发期出错；**或上游返回 4xx/5xx** | `{"type": "error", "error": {"message": "upstream failed: <错误信息>"}}`；上游 4xx/5xx 时 `<错误信息>` 为 `HTTP Error <code>: <reason>`（复刻旧实现，见下） |
+| 2xx / 3xx | 上游最终（跟随重定向后）返回的成功/重定向状态码 | 原样透传上游响应体与状态码 |
 
+- **上游 4xx/5xx 的文案**：`upstream failed: HTTP Error <code>: <reason>`，`<reason>` 取
+  Python `http.client.responses` 的标准原因短语（如 `400 Bad Request`、`404 Not Found`、
+  `429 Too Many Requests`、`503 Service Unavailable`），未收录的码用 `Unknown`。这是复刻旧实现
+  （`urllib` 对非 2xx/3xx 抛 `HTTPError` 后被 `except` 吞成 502）；缓冲与 `MUSE_STREAM=1`
+  两档行为一致。完整边界见 `docs/COMPAT.md` §2.1 / §2.3。
 - 上游响应的响应头（除 `Transfer-Encoding` / `Connection` / `Content-Length`）原样透传；
   缓冲模式自算 `Content-Length`，流式模式改为 `chunked`。
-- `<解析信息>` 与 `<错误信息>` 的具体文本由 Go 运行时产生，与 Python 版本的措辞不同（详见 `docs/COMPAT.md`）；
-  外层信封与各状态码语义保持一致。
+- `<解析信息>` 与 `<错误信息>` 中非 HTTP 类的具体文本由 Go 运行时产生，与 Python 版本的措辞不同
+  （详见 `docs/COMPAT.md`）；外层信封与各状态码语义保持一致。
 
 ## 6. 副作用 / 幂等 / 限流 / 超时
 

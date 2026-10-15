@@ -86,19 +86,29 @@ grep -c 'CLIENT-SECRET' new-stream0.log
 ## 4. 响应回传（状态码 / 响应头 / Content-Length）
 
 ```sh
+# 2xx 透传（假上游默认 200）
+curl -sS -D - -o /tmp/body4 -X POST http://127.0.0.1:19287/v1/chat/completions \
+  -H 'Content-Type: application/json' -H 'X-Fake-Status: 200' -d '{"model":"muse-spark-1.3-contributor"}'
+# 上游 4xx/5xx → 502（复刻旧实现，见 §12）
 curl -sS -D - -o /tmp/body4 -X POST http://127.0.0.1:19287/v1/chat/completions \
   -H 'Content-Type: application/json' -H 'X-Fake-Status: 503' -d '{"model":"muse-spark-1.3-contributor"}'
 ```
 
 ```
-HTTP/1.1 503 Service Unavailable
+HTTP/1.1 200 OK
 Content-Length: 297
 Content-Type: application/json
 X-Fake-Upstream: yes
 body bytes: 297
+
+HTTP/1.1 502 Bad Gateway
+Content-Length: 95
+Content-Type: application/json
+body: {"type": "error", "error": {"message": "upstream failed: HTTP Error 503: Service Unavailable"}}
 ```
 
-状态码 `503` 透传、自定义头 `X-Fake-Upstream` 透传、自设 `Content-Length` 与 body 字节数一致。
+`2xx` 状态码透传、上游自定义头 `X-Fake-Upstream` 透传、自设 `Content-Length` 与 body 字节数一致；
+上游 `4xx/5xx` 一律回 `502` + `upstream failed: HTTP Error <code>: <reason>`（需求书 §6.4）。
 
 ## 5. 错误分支 502（不可达 / 超时）
 
@@ -176,7 +186,7 @@ curl -sS -D h1 -o b1 -w 'time_starttransfer=%{time_starttransfer}s time_total=%{
 | c4 缺 model | 403 `model None not allowed` | 403 `model None not allowed` | 一致 |
 | c5 `GET /v1/models` | 200 | 200 | 一致（同上请求头回显差异：旧还多 `Content-Type: application/x-www-form-urlencoded`） |
 | c6 `PATCH` | 501（HTML 错误页） | 501（纯文本） | 状态码一致；体不同 |
-| c7 上游 503 | **502** `upstream failed: HTTP Error 503` | **503** + 上游响应体 | **不一致：旧实现把所有非 2xx/3xx 变 502（urllib 抛 `HTTPError`），需求书 §2.5/§6.4 要求透传 → 本版按需求书透传**，详见 `docs/COMPAT.md` §2.1 |
+| c7 上游 503 | **502** `upstream failed: HTTP Error 503: Service Unavailable` | **502** 同文案 | 一致（复刻旧实现把 4xx/5xx 变 502，见 §12） |
 
 现网 8787 复核（不触上游的分支）：
 
@@ -275,6 +285,68 @@ RECV HEAD   http://afterrun.example/v1/models     HTTP/1.1 content-length=0
 （`cmp expected.tsv got.tsv`）完全一致。未映射形态仅剩带 UTF-16 / UTF-32 BOM 的 body，
 已在 `docs/COMPAT.md` §2.2 说明。单测 `internal/proxy.TestBadJSONMessagesMatchPython`、
 `internal/httpx.TestPyDecodeErrorsMatchPython`。
+
+## 12. 状态码口径对齐：上游 4xx/5xx → 502（2026-10-16）
+
+需求书 §2.6 / §6.4 按旧实现实测改定为「上游 4xx/5xx 一律回 502」。同机、同假上游
+（`tools/fakeupstream`）、同假出口代理（`tools/fakeproxy`）跑同一请求矩阵：
+
+- 旧实现 = `/usr/local/bin/muse-proxy.py` 同源副本（`PORT=19393`，仅换 4 个常量）；
+- 新缓冲 = `MUSE_STREAM=0`（`19287`）；新流式 = `MUSE_STREAM=1`（`19288`）。
+
+复现命令：`bash .acceptance/parity.sh`（原始输出见 `.acceptance/parity.out`）。
+
+| 上游 `X-Fake-Status` | 旧（19393） | 新缓冲（19287） | 新流式（19288） | 结论 |
+|---|---|---|---|---|
+| 200 / 201 | 200 / 201 | 200 / 201 | 200 / 201 | 一致（2xx 不受影响） |
+| 400 | 502 `HTTP Error 400: Bad Request` | 同左 | 同左 | 逐字节一致 |
+| 401 | 502 `HTTP Error 401: Unauthorized` | 同左 | 同左 | 逐字节一致 |
+| 403 | 502 `HTTP Error 403: Forbidden` | 同左 | 同左 | 逐字节一致 |
+| 404 | 502 `HTTP Error 404: Not Found` | 同左 | 同左 | 逐字节一致 |
+| 405 | 502 `HTTP Error 405: Method Not Allowed` | 同左 | 同左 | 逐字节一致 |
+| 409 | 502 `HTTP Error 409: Conflict` | 同左 | 同左 | 逐字节一致 |
+| 422 | 502 `HTTP Error 422: Unprocessable Entity` | 同左 | 同左 | 逐字节一致 |
+| 429 | 502 `HTTP Error 429: Too Many Requests` | 同左 | 同左 | 逐字节一致 |
+| 500 | 502 `HTTP Error 500: Internal Server Error` | 同左 | 同左 | 逐字节一致 |
+| 502 | 502 `HTTP Error 502: Bad Gateway` | 同左 | 同左 | 逐字节一致 |
+| 503 | 502 `HTTP Error 503: Service Unavailable` | 同左 | 同左 | 逐字节一致 |
+| 504 | 502 `HTTP Error 504: Gateway Timeout` | 同左 | 同左 | 逐字节一致 |
+| 413 | 502 `HTTP Error 413: Request Entity Too Large` | 502 `... 413: Payload Too Large` | 同左 | **文案不同**（旧取上游状态行短语，本版取标准表；见 `COMPAT.md` §2.3） |
+| 414 | 502 `... 414: Request URI Too Long` | 502 `... 414: URI Too Long` | 同左 | 文案不同（同上） |
+| 416 | 502 `... 416: Requested Range Not Satisfiable` | 502 `... 416: Range Not Satisfiable` | 同左 | 文案不同（同上） |
+| 418 | 502 `... 418: I'm a teapot` | 502 `... 418: I'm a Teapot` | 同左 | 文案不同（同上） |
+| 599（未收录） | 502 `... 599: status code 599` | 502 `... 599: Unknown` | 同左 | 文案不同（同上） |
+| 302（无 Location） | 502 `... 302: Found` | 302 原样 | 302 原样 | 3xx 透传（需求书 §2.6）；带 Location 时两者都跟随 |
+
+原始输出（节选）：
+
+```
+--- 上游 X-Fake-Status: 400 ---
+old   502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 400: Bad Request"}}
+new0  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 400: Bad Request"}}
+new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 400: Bad Request"}}
+--- 上游 X-Fake-Status: 404 ---
+old   502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 404: Not Found"}}
+new0  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 404: Not Found"}}
+new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 404: Not Found"}}
+--- 上游 X-Fake-Status: 429 ---
+old   502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 429: Too Many Requests"}}
+new0  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 429: Too Many Requests"}}
+new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 429: Too Many Requests"}}
+--- 上游 X-Fake-Status: 503 ---
+old   502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 503: Service Unavailable"}}
+new0  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 503: Service Unavailable"}}
+new1  502 | {"type": "error", "error": {"message": "upstream failed: HTTP Error 503: Service Unavailable"}}
+```
+
+非 HTTP 异常（不可达 / 超时）仍回 502，前缀 `upstream failed: `，文案为 Go 措辞（唯一无法逐字节对齐的一类）：
+
+```
+{"type": "error", "error": {"message": "upstream failed: Post \"...\": net/http: timeout awaiting response headers"}}   status=502
+{"type": "error", "error": {"message": "upstream failed: Post \"...\": proxyconnect tcp: dial tcp 127.0.0.1:1: connect: connection refused"}}   status=502
+```
+
+新版日志中未出现测试 key（`grep -c parity-key .acceptance/new-*.log` → `0`）。
 
 ## 端到端测试
 
