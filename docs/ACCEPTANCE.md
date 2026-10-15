@@ -59,7 +59,7 @@ curl -sS -o /dev/null -w 'status=%{http_code}\n' http://127.0.0.1:19287/v1/model
 status=200
 {"type": "error", "error": {"message": "model gpt-4 not allowed through proxy"}}
 status=403
-{"type": "error", "error": {"message": "bad request: invalid character 'o' in literal null (expecting 'u')"}}
+{"type": "error", "error": {"message": "bad request: Expecting value: line 1 column 1 (char 0)"}}
 status=400
 status=200
 fake-upstream GET /v1/models auth=Bearer parity-key
@@ -172,7 +172,7 @@ curl -sS -D h1 -o b1 -w 'time_starttransfer=%{time_starttransfer}s time_total=%{
 |---|---|---|---|
 | c1 白名单模型 | 200 | 200 | 一致（响应体差异仅在假上游回显的请求头：旧多 `Accept-Encoding: identity`/`Connection: close`） |
 | c2 非白名单 `gpt-4` | 403 + 逐字节相同 | 403 + 逐字节相同 | 一致 |
-| c3 非 JSON body | 400 `bad request: Expecting value...` | 400 `bad request: invalid character...` | 状态码一致；内层错误文案不同（运行时差异） |
+| c3 非 JSON body | 400 `bad request: Expecting value: line 1 column 1 (char 0)` | 400 同上（逐字节相同） | 一致（内层文案复刻 Python `json` 模块，见 §11.2） |
 | c4 缺 model | 403 `model None not allowed` | 403 `model None not allowed` | 一致 |
 | c5 `GET /v1/models` | 200 | 200 | 一致（同上请求头回显差异：旧还多 `Content-Type: application/x-www-form-urlencoded`） |
 | c6 `PATCH` | 501（HTML 错误页） | 501（纯文本） | 状态码一致；体不同 |
@@ -184,7 +184,7 @@ curl -sS -D h1 -o b1 -w 'time_starttransfer=%{time_starttransfer}s time_total=%{
 OLD8787 {"type": "error", "error": {"message": "model gpt-4 not allowed through proxy"}} <<status=403>>
 NEW19287 {"type": "error", "error": {"message": "model gpt-4 not allowed through proxy"}} <<status=403>>
 OLD8787 {"type": "error", "error": {"message": "bad request: Expecting value: line 1 column 1 (char 0)"}} <<status=400>>
-NEW19287 {"type": "error", "error": {"message": "bad request: invalid character 'o' in literal null (expecting 'u')"}} <<status=400>>
+NEW19287 {"type": "error", "error": {"message": "bad request: Expecting value: line 1 column 1 (char 0)"}} <<status=400>>
 OLD8787 {"type": "error", "error": {"message": "model None not allowed through proxy"}} <<status=403>>
 NEW19287 {"type": "error", "error": {"message": "model None not allowed through proxy"}} <<status=403>>
 ```
@@ -225,6 +225,56 @@ ps -o pid,rss,comm -p <new_pid>
 空载 RSS：≈ 7.4–13.5 MiB（旧 Python 实现现网进程 15.5 MiB，仅作对照）
 冷启动：12 ms（启动到端口可连接）
 ```
+
+## 11. 兼容性修复记录（2026-10-16）
+
+并排对照暴露两处旧实现可观测行为未对齐：空 body 请求未向上游补发 `Content-Length: 0`、
+`400` 内层文案用的是 `encoding/json` 的 Go 文案而非 Python `json` 模块文案。两处均已修复并各配单测。
+
+下方为同机、同参数、真实运行取证的「旧实现 / 修复前 / 修复后」三者对照：旧实现为
+`/usr/local/bin/muse-proxy.py` 的同源副本（仅换 `UPSTREAM` / `MIXED_PROXY` / `PORT` / `AUTH_HEADER` 四个常量，
+逻辑未动），修复前取修复前提交构建的二进制，修复后取当前工作树构建的二进制；三者的出口代理串到同一
+抓包记录器，由其打印转发到上游的原始请求行与 `Content-Length`。
+
+### 11.1 空 body 请求补发 `Content-Length: 0`
+
+```
+RECV GET    http://oldrun.example/v1/models       HTTP/1.1 content-length=0          ← 旧实现
+RECV GET    http://beforerun.example/v1/models    HTTP/1.1 content-length=<MISSING>  ← 修复前
+RECV GET    http://afterrun.example/v1/models     HTTP/1.1 content-length=0          ← 修复后
+RECV DELETE http://oldrun.example/v1/files/abc    HTTP/1.1 content-length=0
+RECV DELETE http://beforerun.example/v1/files/abc HTTP/1.1 content-length=<MISSING>
+RECV DELETE http://afterrun.example/v1/files/abc  HTTP/1.1 content-length=0
+RECV HEAD   http://oldrun.example/v1/models       HTTP/1.1 content-length=0
+RECV HEAD   http://beforerun.example/v1/models    HTTP/1.1 content-length=<MISSING>
+RECV HEAD   http://afterrun.example/v1/models     HTTP/1.1 content-length=0
+```
+
+修复后 GET / HEAD / DELETE 与旧实现一致，均为 `content-length=0`；带 body 的 POST 仍发真实长度
+（`content-length=52`），语义与旧实现 `data=b""` 对齐。单测
+`internal/proxy.TestBodylessRequestsSendContentLengthZero`。
+
+### 11.2 `400` 内层文案复刻 Python `json` 模块
+
+同一串非法 / 非对象 body（`POST /v1/chat/completions`，`Content-Type: application/json`）的状态码与响应体：
+
+| body | 旧实现 | 修复前 | 修复后 |
+|---|---|---|---|
+| `{not json` | `bad request: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)` | `bad request: invalid character 'n' looking for beginning of object key string` | 同旧实现 |
+| `{"a"` | `bad request: Expecting ':' delimiter: line 1 column 5 (char 4)` | `bad request: unexpected EOF` | 同旧实现 |
+| `{"a":1} extra` | `bad request: Extra data: line 1 column 9 (char 8)` | `bad request: trailing data after JSON value` | 同旧实现 |
+| `not json` | `bad request: Expecting value: line 1 column 1 (char 0)` | `bad request: invalid character 'o' in literal null (expecting 'u')` | 同旧实现 |
+| `[1,2]` | `bad request: 'list' object has no attribute 'get'` | `bad request: payload is not a JSON object` | 同旧实现 |
+| `"str"` | `bad request: 'str' object has no attribute 'get'` | `bad request: payload is not a JSON object` | 同旧实现 |
+
+三实例在 `{"model":"gpt-4"}`（403）与 `{}`（403）上逐字节相同，未受本次改动影响。
+
+修复方式：`internal/httpx` 移植 CPython 3.13 `Modules/_json.c` 的扫描器，在 rune（code point）
+序列上计位，使其行列与 `char` 偏移同 Python 一致（含多字节字符：`{"é":}` → `char 5`、非字节 `6`）。
+解析成功但值不是对象时复刻 `AttributeError`。122 条真实向量与 Python `json.loads` 逐字节比对
+（`cmp expected.tsv got.tsv`）完全一致。未映射形态仅剩带 UTF-16 / UTF-32 BOM 的 body，
+已在 `docs/COMPAT.md` §2.2 说明。单测 `internal/proxy.TestBadJSONMessagesMatchPython`、
+`internal/httpx.TestPyDecodeErrorsMatchPython`。
 
 ## 端到端测试
 

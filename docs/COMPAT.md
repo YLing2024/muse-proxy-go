@@ -10,8 +10,8 @@
 |---|---|---|
 | 1 | 监听 `127.0.0.1:8787` → 新版 `127.0.0.1:19287` | `MUSE_LISTEN` 默认 `127.0.0.1:19287`，强制回环；旧版不动。 |
 | 2 | 去掉前导 `/v1` 再拼上游 base | `stripV1`：`strings.HasPrefix(path, "/v1")` 则裁剪，与旧实现同源；query 保留。 |
-| 3 | 白名单三分支 | 见下节「白名单」。 |
-| 4 | 请求头过滤 + 覆盖 Authorization | 丢弃 `host` / `content-length` / `connection` / `authorization`，其余透传，`Authorization` 覆盖为 `Bearer <key>`。 |
+| 3 | 白名单三分支 | 见下节「白名单」。`400` 内层文案复刻 Python `json` 模块的 `JSONDecodeError`（行列 / `char` 偏移逐字节一致，见 §2.2）。 |
+| 4 | 请求头过滤 + 覆盖 Authorization | 丢弃 `host` / `content-length` / `connection` / `authorization`，其余透传，`Authorization` 覆盖为 `Bearer <key>`；空 body 时向上游补发 `Content-Length: 0`（对齐旧实现 `data=b""`，见 §2.2）。 |
 | 5 | 响应头过滤 + 自设 Content-Length | 丢弃 `transfer-encoding` / `connection` / `content-length`，**状态码透传**，缓冲模式自设 `Content-Length`（旧实现实际会把 4xx/5xx 变 502，见 §2.1）。 |
 | 6 | 上游失败/超时 → 502 | 转发链路失败（不可达、超时）回 `502`，message 前缀 `upstream failed: `；上游正常返回的 4xx/5xx 不算失败、原样透传。 |
 | 7 | 五方法同处理器，其余 501 | `routeTable` 登记 GET/POST/PUT/DELETE/HEAD；未登记方法回 `501` 且不转发。 |
@@ -28,7 +28,10 @@
 - `model` 不在白名单（含缺 `model`、`model` 非字符串）→ **403**，体为
   `{"type": "error", "error": {"message": "model <m> not allowed through proxy"}}`，
   其中 `<m>` 复刻 Python 的字符串化（缺省为 `None`）。
-- body 不是合法 JSON（或 JSON 不是对象、尾部有多余内容）→ **400**。
+- body 不是合法 JSON（或 JSON 不是对象、尾部有多余内容）→ **400**，内层文案与旧实现
+  （Python `json.loads`）逐字节一致：解析失败复刻 `JSONDecodeError` 的
+  `msg: line L column C (char N)`（按 code point 计位）；解析成功但值不是对象时复刻
+  `AttributeError`，如 `'list' object has no attribute 'get'`。详见 §2.2。
 
 ### 日志（需求书 §2.11）
 
@@ -39,20 +42,18 @@
 ## 2. 无法逐字节一致的地方（本质差异，非有意设计）
 
 这些差异来自 Go 与 Python 运行时，**不影响功能与状态码语义**；验收的并排对照只比
-状态码 / 响应体（白名单分支）/ 关键响应头。
+状态码 / 响应体 / 关键响应头。
 
 | 项 | 旧实现（Python） | 本版（Go） | 影响 |
 |---|---|---|---|
-| `400` 内层文案 | `bad request: Expecting value: line 1 column 1 (char 0)` 等 Python 文案 | `bad request: invalid character ...` 等 Go 文案 | 外层信封与状态码一致，内层错误文本不同。 |
 | `502` 内层文案 | `upstream failed: <urlopen error [Errno 111] ...>` | `upstream failed: <Go net/http 错误>` | 前缀与状态码一致，错误文本不同。 |
 | `501` 响应体 | `send_error` 生成的 HTML 错误页 | 纯文本 `unsupported method` | 状态码一致，体不同。 |
 | 请求头大小写 | `urllib` 会把头名 `capitalize`（如 `Content-type`） | `net/http` 规范化为 `Content-Type` | HTTP 头名大小写不敏感，语义一致。 |
 | 同名请求头 | 收进 dict，只保留最后一个值 | 同样只保留最后一个值 | 语义一致（已显式对齐）。 |
-| 空 body 的 `Content-Length` | 对 GET 等也发 `Content-Length: 0` | 对 GET 不发 `Content-Length`（POST/PUT 仍发 `0`） | 转发层按 body 重算长度，不影响上游可见语义。 |
 | 响应 `Date` / `Server` 头 | 旧实现会同时发自身的与上游的两份 `Date`/`Server` | 只保留上游的 `Date`，不发自身 `Server` | 非关键头，客户端忽略。 |
 | 自动 gzip | 不透明解压 | `DisableCompression=true`，同样不透明解压、不擅自加 `Accept-Encoding` | 行为一致（已显式对齐）。 |
 | 响应头重复值 | `email.message` 可能合并重复头 | 逐个 `Add` 保留 | 语义一致。 |
-| 上游请求头附加项 | `urllib` 额外加 `Accept-Encoding: identity`、`Connection: close`，无 body 时还会加 `Content-Type: application/x-www-form-urlencoded` | 纯透传（只转发客户端实际带的头） | 需求书 §2.4 要求「其余原样透传」，故不复制 urllib 的运行时默认头；上游可见的额外头不同。 |
+| 上游请求头附加项 | `urllib` 额外加 `Accept-Encoding: identity`、`Connection: close`，无 body 时还会加 `Content-Type: application/x-www-form-urlencoded` | 纯透传（只转发客户端实际带的头），空 body 时补 `Content-Length: 0` | 需求书 §2.4 要求「其余原样透传」，故不复制 urllib 的运行时默认头；上游可见的额外头不同。 |
 | 重定向 | `urllib` 默认跟随 301/302/303/307 | `net/http` 默认跟随 301/302/303/307/308 | 两者都跟随重定向，边界（跨主机是否携带 Authorization）略有差异。 |
 
 ## 2.1 旧实现自身与需求书不一致处（本版按需求书实现）
@@ -69,6 +70,25 @@
 
 > 这是本次重写发现的旧实现缺陷，不是本版新增的差异；如需与旧版逐字节一致地「把 4xx/5xx 变成 502」，
 > 需要产品方确认后另行改需求书。
+
+## 2.2 已对齐的两处旧实现行为（2026-10-16 修复）
+
+并排对照曾把下列两项列为差异，现已按旧实现可观测行为对齐，并各配单测：
+
+| 项 | 旧实现（Python） | 修复前（Go） | 修复后（Go） |
+|---|---|---|---|
+| 空 body 请求的上游 `Content-Length` | `data=b""` 使 `urllib` 对 GET/HEAD/DELETE 也发 `Content-Length: 0` | 完全不发该头 | 也发 `Content-Length: 0` |
+| `400` 内层文案 | `json.loads` 的 `JSONDecodeError` 文案（含真实行列 / `char`） | `encoding/json` 的 Go 文案 | 逐字节复刻 Python 文案 |
+
+`400` 覆盖的形态（`internal/httpx` 移植 CPython 3.13 `Modules/_json.c` 的扫描器，
+在 rune 序列上计位）：`Expecting value`、`Expecting property name enclosed in double quotes`、
+`Expecting ':' delimiter`、`Expecting ',' delimiter`、`Unterminated string starting at`、
+`Extra data`、`Invalid control character at`，以及 `Illegal trailing comma ...`、
+`Invalid \escape`、`Invalid \uXXXX escape`；解析成功但非对象时复刻 `AttributeError`
+（`'list'` / `'str'` / `'int'` / `'float'` / `'bool'` / `'NoneType'`）。
+
+**未映射形态**：只有带 UTF-16/UTF-32 BOM 的 body（Python `detect_encoding` 会据此选编码）。
+UTF-8（含 UTF-8 BOM、以及 `surrogatepass` 允许的代理区编码）已逐字节对齐。
 
 ## 3. 唯一有意差异：MUSE_STREAM
 
