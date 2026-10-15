@@ -1,0 +1,16 @@
+# nginx 反代样例（只提交，不安装）。muse-proxy-go 只监听 127.0.0.1:19287。
+# 该服务走流式热路径：必须关闭代理缓冲，否则会破坏 SSE 逐块到达。
+server {
+    listen 443 ssl;
+    server_name example.com;
+
+    location /v1/ {
+        proxy_pass http://127.0.0.1:19287;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_request_buffering off;
+        proxy_read_timeout 300s;
+    }
+}

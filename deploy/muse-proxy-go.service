@@ -1,0 +1,25 @@
+# muse-proxy-go 的 systemd 单元样例（只提交，不安装到 /etc；旧 Python 版继续在原单元跑）。
+# 实际部署时把 EnvironmentFile 指向仅 root 可读的环境文件（权限 0600）。
+[Unit]
+Description=muse-spark proxy (Go 版，muse-proxy-go)
+After=network-online.target mihomo.service
+Requires=mihomo.service
+
+[Service]
+Type=simple
+User=muse-proxy
+EnvironmentFile=-/etc/muse-proxy-go.env
+ExecStart=/usr/local/bin/muse-proxy-go
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=true
+StandardOutput=append:/var/log/muse-proxy-go.log
+StandardError=append:/var/log/muse-proxy-go.log
+# 上游 key 由 EnvironmentFile 注入；本单元不写任何凭据。
+ReadWritePaths=/var/log
+
+[Install]
+WantedBy=multi-user.target
