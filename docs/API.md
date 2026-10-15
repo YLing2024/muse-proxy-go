@@ -116,10 +116,10 @@
 | `3xx`（带 `Location`） | 上游返回 `Location`，由客户端跟随重定向（非成环时） | 跟随后的最终响应（状态码/体/头）原样回传 |
 
 - **上游 4xx/5xx、未带 `Location` 的 3xx 的文案**：`upstream failed: HTTP Error <code>: <reason>`。
-  `<reason>` **优先取上游状态行里的原样短语**（旧实现 `urllib` 的 `HTTPError` 文案即取此处，
-  如上游写 `HTTP/1.1 413 Nope` 则文案为 `... 413: Nope`）；**仅当**上游未给短语时（HTTP/2 无
-  reason，或状态行只写到码）才回落到标准表 Python `http.client.responses`（如 `400 Bad Request`、
-  `404 Not Found`、`429 Too Many Requests`、`503 Service Unavailable`，未收录的码用 `Unknown`）。
+  `<reason>` **原样取上游状态行里的短语**（旧实现 `urllib` 的 `HTTPError` 文案即取此处，
+  如上游写 `HTTP/1.1 413 Nope` 则文案为 `... 413: Nope`）；**上游未给短语时留空串**
+  （如 `HTTP/1.1 500` → 文案为 `... 500: `，冒号后为空）——旧实现从不查标准短语表，本版
+  同样不查。
   这是复刻旧实现（`urllib` 对非 2xx 抛 `HTTPError` 后被 `except` 吞成 502）；缓冲与
   `MUSE_STREAM=1` 两档行为一致。完整边界见 `docs/COMPAT.md` §2.1 / §2.3。
 - **重定向环的文案**：上游把请求导进环（同一 URL 跟随超过 4 次，或累计跟随超过 10 个
