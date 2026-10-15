@@ -3,8 +3,6 @@
 package proxy
 
 import (
-	"bytes"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -106,24 +104,20 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // checkModel 仅对「带 body」的请求做白名单校验，返回 (model, 0, nil) 表示放行。
 // 无 body 的请求（如 GET /models）直接放行，model 为空串。
+//
+// 解析走 httpx.PyDecode（移植自 CPython），以保证 400 文案与旧实现逐字节一致。
 func checkModel(body []byte) (model string, status int, err error) {
 	if len(body) == 0 {
 		return "", 0, nil
 	}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.UseNumber()
-	var payload any
-	if err := dec.Decode(&payload); err != nil {
-		return "", http.StatusBadRequest, fmt.Errorf("bad request: %w", err)
-	}
-	// 旧实现用 json.loads，会拒绝尾部多余内容；这里显式探测第二段 JSON。
-	var extra any
-	if err := dec.Decode(&extra); err != io.EOF {
-		return "", http.StatusBadRequest, fmt.Errorf("bad request: trailing data after JSON value")
+	payload, perr := httpx.PyDecode(body)
+	if perr != nil {
+		return "", http.StatusBadRequest, fmt.Errorf("bad request: %s", perr.Error())
 	}
 	obj, ok := payload.(map[string]any)
 	if !ok {
-		return "", http.StatusBadRequest, fmt.Errorf("bad request: payload is not a JSON object")
+		// 旧实现直接 payload.get(...)，非对象会抛 AttributeError，同样走 400。
+		return "", http.StatusBadRequest, fmt.Errorf("bad request: %s", httpx.PyAttrError(payload))
 	}
 	raw := obj["model"]
 	name, ok := raw.(string)

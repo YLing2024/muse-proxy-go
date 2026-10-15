@@ -309,6 +309,56 @@ func TestBufferedModeHasContentLength(t *testing.T) {
 	}
 }
 
+// TestBodylessRequestsSendContentLengthZero 对齐旧实现：urllib 对空 body 也传
+// data=b""，于是 GET/HEAD/DELETE 上游同样收到 Content-Length: 0。
+func TestBodylessRequestsSendContentLengthZero(t *testing.T) {
+	fp := newFakeProxy(t, okResponder)
+	srv, _ := newTestProxy(t, &config.Config{}, fp)
+
+	for _, method := range []string{"GET", "HEAD", "DELETE", "POST", "PUT"} {
+		resp, _ := doReq(t, srv.URL, method, "/v1/models", "", nil)
+		if resp.StatusCode != 200 {
+			t.Fatalf("%s 应 200，得到 %d", method, resp.StatusCode)
+		}
+		got := fp.last(t)
+		if got.method != method {
+			t.Fatalf("上游收到的方法应为 %s，得到 %s", method, got.method)
+		}
+		if cl := got.header.Get("Content-Length"); cl != "0" {
+			t.Errorf("%s 无 body 时上游应收到 Content-Length: 0，得到 %q（头：%v）", method, cl, got.header)
+		}
+	}
+}
+
+// TestBadJSONMessagesMatchPython 锁定 400 内层文案与 Python json 模块一致。
+func TestBadJSONMessagesMatchPython(t *testing.T) {
+	fp := newFakeProxy(t, okResponder)
+	srv, _ := newTestProxy(t, &config.Config{}, fp)
+
+	cases := []struct {
+		body string
+		want string
+	}{
+		{`{not json`, `{"type": "error", "error": {"message": "bad request: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)"}}`},
+		{`{"a"`, `{"type": "error", "error": {"message": "bad request: Expecting ':' delimiter: line 1 column 5 (char 4)"}}`},
+		{`{"a":1} extra`, `{"type": "error", "error": {"message": "bad request: Extra data: line 1 column 9 (char 8)"}}`},
+		{`not json`, `{"type": "error", "error": {"message": "bad request: Expecting value: line 1 column 1 (char 0)"}}`},
+		// 解析成功但非对象：旧实现调用 payload.get 抛 AttributeError。
+		{`[1,2]`, `{"type": "error", "error": {"message": "bad request: 'list' object has no attribute 'get'"}}`},
+		{`"str"`, `{"type": "error", "error": {"message": "bad request: 'str' object has no attribute 'get'"}}`},
+	}
+	for _, c := range cases {
+		resp, body := doReq(t, srv.URL, "POST", "/v1/chat/completions", c.body, nil)
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("body=%q 应 400，得到 %d", c.body, resp.StatusCode)
+			continue
+		}
+		if body != c.want {
+			t.Errorf("body=%q 错误体不一致：\n got=%s\nwant=%s", c.body, body, c.want)
+		}
+	}
+}
+
 func TestUnsupportedMethodReturns501(t *testing.T) {
 	fp := newFakeProxy(t, okResponder)
 	srv, _ := newTestProxy(t, &config.Config{}, fp)
