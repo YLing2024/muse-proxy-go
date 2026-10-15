@@ -1,0 +1,17 @@
+# 构建产物
+/muse-proxy-go
+/tools/fakeupstream/fakeupstream
+/tools/fakeproxy/fakeproxy
+
+# 运行时数据与本地实值（含真实 key 的配置文件绝不入库）
+.env
+.env.local
+*.log
+
+# 验收用临时产物（脚本、假上游/假代理日志、进程 PID）
+/.acceptance/
+
+# 编辑器/系统
+.DS_Store
+.vscode/
+.idea/
